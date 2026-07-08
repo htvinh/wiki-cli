@@ -1,29 +1,24 @@
 """
 linter.py
 
-Stage 4 of the compiler: walks the compiled output directory and checks
-its own work. No LLM-as-a-judge -- just deterministic structural checks:
-
-  - broken references: a [[Link]] that points to a page not present
-    in the compiled set
-  - orphan pages: pages with zero incoming references (also surfaced
-    by graph.py, re-checked here against the actual written files as
-    a belt-and-suspenders validation step)
-
-Returns a structured report; also usable as a standalone CLI.
+Stage 4: walks the compiled output directory and checks for
+broken references and orphan pages.
 """
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 
+from exceptions import LintError
+
+logger = logging.getLogger(__name__)
 
 LINK_RE = re.compile(r"\[\[(.+?)\]\]")
 SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 
 
 def _extract_section(text: str, heading: str) -> str:
-    """Returns the body text under a given '## Heading', or '' if absent."""
     matches = list(SECTION_RE.finditer(text))
     for i, m in enumerate(matches):
         if m.group(1).strip() == heading:
@@ -36,8 +31,8 @@ def _extract_section(text: str, heading: str) -> str:
 @dataclass
 class LintReport:
     total_pages: int = 0
-    broken_links: list = field(default_factory=list)   # (source_file, broken_target_name)
-    orphan_pages: list = field(default_factory=list)    # filenames with no incoming links
+    broken_links: list = field(default_factory=list)
+    orphan_pages: list = field(default_factory=list)
 
     def is_clean(self) -> bool:
         return not self.broken_links and not self.orphan_pages
@@ -49,30 +44,30 @@ def _slugify(name: str) -> str:
 
 def lint(output_dir: str) -> LintReport:
     report = LintReport()
-    files = sorted(f for f in os.listdir(output_dir) if f.endswith(".md"))
-    report.total_pages = len(files)
 
+    try:
+        files = sorted(f for f in os.listdir(output_dir) if f.endswith(".md"))
+    except OSError as e:
+        raise LintError(f"Cannot list directory {output_dir}: {e}") from e
+
+    report.total_pages = len(files)
     known_slugs = {os.path.splitext(f)[0] for f in files}
-    incoming_count = {slug: 0 for slug in known_slugs}
+    incoming_count: dict = {slug: 0 for slug in known_slugs}
 
     for fname in files:
         path = os.path.join(output_dir, fname)
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            raise LintError(f"Cannot read {path}: {e}") from e
 
-        # Broken-link check: any [[link]] anywhere in the file must resolve
-        # to a known page, regardless of which section it's in.
         for match in LINK_RE.finditer(text):
             target_name = match.group(1)
             target_slug = _slugify(target_name)
             if target_slug not in known_slugs:
                 report.broken_links.append((fname, target_name))
 
-        # Incoming-link count for orphan detection: only count links from
-        # the "Related" section (true outgoing edges). The "Referenced By"
-        # section also contains [[links]], but those name pages that link
-        # TO this one -- counting them here would double back on itself
-        # and make every page falsely look non-orphaned.
         related_text = _extract_section(text, "Related")
         for match in LINK_RE.finditer(related_text):
             target_slug = _slugify(match.group(1))
@@ -84,6 +79,12 @@ def lint(output_dir: str) -> LintReport:
             report.orphan_pages.append(f"{slug}.md")
 
     report.orphan_pages.sort()
+    logger.info(
+        "Linted %d pages: %d broken links, %d orphans",
+        report.total_pages,
+        len(report.broken_links),
+        len(report.orphan_pages),
+    )
     return report
 
 
@@ -105,5 +106,6 @@ def print_report(report: LintReport) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     r = lint("compiled_wiki")
     print_report(r)

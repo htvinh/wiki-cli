@@ -1,129 +1,118 @@
-# wiki-compiler
+# wiki-cli
 
-A pure-Python compiler that turns raw, messy text notes into a linked, linted markdown wiki. No LLM calls, no embeddings, no dependencies.
+A Python tool that compiles raw notes into a linked, linted markdown wiki. Deterministic, incremental, and supports multiple input formats via MarkItDown.
 
 ![Python Version](https://img.shields.io/badge/python-3.12%2B-blue) ![License](https://img.shields.io/badge/license-MIT-green)
-
-Most LLM wiki tutorials stop at: point an agent at your notes, let it decide what's related, let it rewrite pages. This library handles the deterministic part of that job instead: extracting structure, building the link graph, and validating the result, without a single model call.
-
-Read the full write-up on Towards Data Science → [LLM Wikis Are Over-Engineered. I Replaced Mine With a Pure Python Compiler.](https://towardsdatascience.com/author/emmimalp-alexander/)
 
 ## What It Does
 
 ```
-Raw Notes (.txt) → Extractor → Graph → Rewriter → Linter → Compiled Wiki (.md)
+Raw Notes (.txt, .md, .docx, .pdf, .html, ...)
+  → MarkItDown conversion
+  → Extractor (regex entity extraction)
+  → Graph (word-indexed mention matching)
+  → Rewriter (section-aware markdown output)
+  → Linter (broken-link + orphan validation)
+  → Compiled Wiki (.md)
 ```
 
-Four stages, one `compile_wiki()` call:
+## Features
 
-| Component | Job |
-|---|---|
-| Extractor | Regex scan pulling entity name, aliases, created date, and body text out of inconsistently formatted raw files |
-| Graph | Word-indexed phrase matcher detecting mentions between entities, building a bidirectional reference map |
-| Rewriter | Section-aware markdown compilation; regenerates compiler-owned sections, preserves hand-written Notes |
-| Linter | Structural validation: broken `[[links]]` and orphan pages with zero incoming references |
+- **Multi-format input**: `.txt`, `.md`, `.docx`, `.pdf`, `.html`, `.pptx`, `.xlsx`, `.csv`, `.json`, `.xml`, `.rtf` — automagically converted to markdown via MarkItDown
+- **Deterministic**: same input → same output, every time. No LLM calls.
+- **Incremental**: SHA-256 content hashing + mtime/size skip; only changed files are reprocessed
+- **Watch mode**: `--watch` recompiles on any file change
+- **Parallel extraction**: `--workers N` for multi-core speedup
+- **Human-owned sections**: `## Notes` survives recompiles
+- **Plugin system**: custom Extractors, Renderers, Validators, GraphBuilders, LinkResolvers
+- **Persistent cache**: SQLite + filesystem body cache; survives full rebuilds
+- **i18n**: Vietnamese and mixed content supported via Unicode `\w` tokeniser
 
 ## Installation
 
 ```bash
-git clone https://github.com/Emmimal/wiki-compiler.git
-cd wiki-compiler
-python init.py
+pip install markitdown
+git clone https://github.com/Emmimal/wiki-cli.git
+cd wiki-cli
+python src/init.py
 ```
-
-No dependencies to install. Standard library only.
 
 ## Quick Start
 
+```bash
+# Compile raw notes → compiled wiki
+python src/compiler.py raw_notes/ compiled_wiki/
+
+# Watch for changes
+python src/compiler.py raw_notes/ compiled_wiki/ --watch
+
+# Parallel extraction (4 workers)
+python src/compiler.py raw_notes/ compiled_wiki/ --workers 4
+```
+
 ```python
-from compiler import compile_wiki
+from src import Compiler, CompilerConfig
 
-result = compile_wiki("raw_notes", "compiled_wiki")
+config = CompilerConfig(lint=True)
+compiler = Compiler(config=config)
+result = compiler.compile("raw_notes", "compiled_wiki")
 
-print(f"Compiled {len(result['written_paths'])} pages")
-print(f"Broken links: {len(result['lint_report'].broken_links)}")
-print(f"Orphan pages: {len(result['lint_report'].orphan_pages)}")
-```
-
-Or from the command line:
-
-```bash
-python compiler.py raw_notes/ compiled_wiki/
-```
-
-## Running the Tests and Benchmark
-
-Seventeen tests, stdlib `unittest` only, covering every stage plus the full end-to-end pipeline:
-
-```bash
-python -m unittest tests -v
-```
-
-Real per-stage timing at three corpus sizes, using a deterministic synthetic corpus (seed=42):
-
-```bash
-python benchmark.py --files 100 --files 1000 --files 5000
+print(f"Compiled {result.pages_written} pages")
+if result.lint_report:
+    print(f"Broken links: {len(result.lint_report.broken_links)}")
+    print(f"Orphan pages: {len(result.lint_report.orphan_pages)}")
 ```
 
 ## CLI Reference
 
 ```
-python compiler.py raw_dir output_dir [--no-lint]
+python src/compiler.py raw_dir output_dir [options]
 
-  raw_dir       Directory of raw .txt source files
-  output_dir    Directory to write compiled .md pages into
-  --no-lint     Skip the lint pass
+  raw_dir              Directory of raw source files
+  output_dir           Directory to write compiled .md pages
+  --no-lint            Skip the lint pass
+  --watch, -w          Watch for file changes and recompile automatically
+  --poll-interval SEC  Polling interval in seconds (default: 1.0)
+  --workers N          Parallel extraction workers (default: 1)
 ```
 
-```
-python benchmark.py [--files N ...] [--seed N]
+## Tests
 
-  --files       Number of files to benchmark at (repeatable)
-  --seed        Random seed for the synthetic corpus generator (default: 42)
-```
-
-## Project Structure
-
-```
-wiki-compiler/
-├── compiler.py       # Orchestrates all four stages behind one function call
-├── extractor.py      # Stage 1: regex metadata extraction
-├── graph.py           # Stage 2: word-indexed mention detection + bidirectional graph
-├── rewriter.py         # Stage 3: section-aware markdown compilation
-├── linter.py            # Stage 4: broken-link and orphan-page validation
-├── generator.py          # Synthetic test corpus generator, for demos and benchmarks
-├── benchmark.py           # Timing harness
-├── init.py                 # Zero-configuration entry point
-└── tests.py                  # 17 unit tests, stdlib only
+```bash
+python -m unittest src.tests -v
 ```
 
-## Performance (two machines, same deterministic outputs)
+125 tests across all stages: store, compiler pipeline, change detection, incremental graph, parallel extraction, plugins, watcher, source provider, converter.
 
-| Files | Extract | Graph | Rewrite | Lint | Compile total | Full pipeline | Orphans |
-|---|---|---|---|---|---|---|---|
-| 100 | 22.8 ms | 3.1 ms | 59.4 ms | 86.0 ms | 85.4 ms | 171.4 ms | 13 |
-| 1,000 | 261.5 ms | 47.1 ms | 605.5 ms | 883.9 ms | 914.1 ms | 1,798.0 ms | 133 |
-| 5,000 | 1,398.4 ms | 625.6 ms | 3,446.7 ms | 6,972.5 ms | 5,470.6 ms | 12,443.1 ms | 644 |
+## Benchmark
 
-Orphan and broken-link counts are identical across every run, on both Linux and Windows. Wall-clock timing varies by hardware and OS; the deterministic outputs don't. `graph` has zero disk I/O and scales the best; `lint` is the most I/O-sensitive stage and the most expensive one at scale.
+```bash
+python src/benchmark.py --files 100 --files 1000 --files 5000
+```
 
-## When to Use This
+## Performance
 
-Worth it when you have:
-- A folder of local, already-written notes you want structured and cross-referenced
-- A workflow where you want the same output every time you recompile
-- No interest in spending tokens on organizational work an agent would redo on every run
+| Files | Full pipeline |
+|-------|--------------|
+| 100   | ~170 ms      |
+| 1,000 | ~1.8 s       |
+| 5,000 | ~12 s        |
 
-Skip it when you have:
-- Notes that need semantic linking, where related ideas are phrased differently rather than sharing exact terms
-- A need for an agent that also drafts new content, not just links existing text
-- Source data too unstructured for regex-based extraction to make sense of
+## Input Formats
 
-## Known Limitations
-
-- Mention detection is lexical, not semantic. Two notes describing the same concept in different words won't link automatically.
-- The extractor handles two header styles and optional metadata fields. Wildly inconsistent or multi-language source data would need a more sophisticated extraction layer.
-- Lint performance is I/O-bound and platform-sensitive; expect Windows to run measurably slower than Linux at scale, likely due to filesystem overhead and antivirus scanning.
+| Extension | Format |
+|-----------|--------|
+| `.txt`    | Plain text |
+| `.md`     | Markdown |
+| `.docx`   | Word document |
+| `.pdf`    | PDF |
+| `.html`   | HTML |
+| `.pptx`   | PowerPoint |
+| `.xlsx`   | Excel |
+| `.csv`    | CSV |
+| `.json`   | JSON |
+| `.xml`    | XML |
+| `.rtf`    | Rich Text Format |
 
 ## License
 

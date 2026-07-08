@@ -1,37 +1,23 @@
 """
 rewriter.py
 
-Stage 3 of the compiler: writes each entity out as a markdown wiki page.
-
-This is deliberately NOT framed as an AST operation. It is targeted string
-replacement between recognized '## Heading' boundaries. Two kinds of
-sections exist in a compiled page:
-
-  - Compiler-owned sections (## Metadata, ## Related): fully regenerated
-    on every compile from the current entities/graph, so they are always
-    in sync with the source.
-  - Human-owned sections (## Notes): if the page already exists on disk
-    and has a ## Notes section, its content is preserved across recompiles
-    instead of being overwritten. If no ## Notes section exists yet, an
-    empty placeholder is created.
-
-This gives the "compile from source of truth, but don't destroy what a
-person typed by hand" behavior without pretending to be a general-purpose
-AST/tree parser.
+Stage 3: writes each entity out as a markdown wiki page.
+Compiler-owned sections are fully regenerated; the human-owned ## Notes
+section is preserved across recompiles.
 """
 
+import logging
 import os
 import re
 
+from exceptions import RewriteError
+
+logger = logging.getLogger(__name__)
 
 SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 
 
 def _parse_existing_sections(text: str) -> dict:
-    """
-    Splits an existing compiled markdown file into {heading: body_text}.
-    Body text for a heading runs until the next '## ' heading or EOF.
-    """
     sections = {}
     matches = list(SECTION_RE.finditer(text))
     for i, m in enumerate(matches):
@@ -42,31 +28,25 @@ def _parse_existing_sections(text: str) -> dict:
     return sections
 
 
-def render_page(entity, graph_edges: dict, entities: dict, existing_path: str = None) -> str:
-    """
-    entity: Entity
-    graph_edges: {"outgoing": set(entity_id), "incoming": set(entity_id)}
-    entities: full {entity_id: Entity} map, needed to resolve link display names
-    existing_path: path to a previously compiled page, if one exists, so its
-                    human-owned ## Notes section can be preserved.
-    """
+def render_page(entity, graph_edges: dict, entities: dict, existing_path: str | None = None) -> str:
     preserved_notes = ""
     if existing_path and os.path.exists(existing_path):
-        with open(existing_path, "r", encoding="utf-8") as f:
-            old_text = f.read()
+        try:
+            with open(existing_path, "r", encoding="utf-8") as f:
+                old_text = f.read()
+        except OSError as e:
+            raise RewriteError(f"Cannot read existing page {existing_path}: {e}") from e
         old_sections = _parse_existing_sections(old_text)
         preserved_notes = old_sections.get("Notes", "").strip()
 
     lines = [f"# {entity.name}", ""]
 
-    # --- Compiler-owned: Metadata ---
     lines.append("## Metadata")
     lines.append(f"- created: {entity.created or 'unknown'}")
     lines.append(f"- aliases: {', '.join(entity.aliases) if entity.aliases else 'none'}")
     lines.append(f"- source: {entity.source_path}")
     lines.append("")
 
-    # --- Compiler-owned: Related (from the graph) ---
     lines.append("## Related")
     outgoing = sorted(graph_edges["outgoing"])
     if outgoing:
@@ -77,7 +57,6 @@ def render_page(entity, graph_edges: dict, entities: dict, existing_path: str = 
         lines.append("- (no outgoing references found)")
     lines.append("")
 
-    # --- Compiler-owned: Referenced By ---
     lines.append("## Referenced By")
     incoming = sorted(graph_edges["incoming"])
     if incoming:
@@ -88,28 +67,38 @@ def render_page(entity, graph_edges: dict, entities: dict, existing_path: str = 
         lines.append("- (orphan: no other page links here)")
     lines.append("")
 
-    # --- Compiler-owned: Body (raw extracted text) ---
     lines.append("## Body")
     lines.append(entity.body)
     lines.append("")
 
-    # --- Human-owned: Notes (preserved across recompiles) ---
     lines.append("## Notes")
-    lines.append(preserved_notes if preserved_notes else "_(add your own notes here -- preserved on recompile)_")
+    placeholder = "_(add your own notes here -- preserved on recompile)_"
+    lines.append(preserved_notes if preserved_notes else placeholder)
     lines.append("")
 
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    logger.debug(
+        "Rendered page '%s' (%s outgoing, %s incoming)",
+        entity.name, len(outgoing), len(incoming),
+    )
+    return content
 
 
 def compile_pages(entities: dict, graph: dict, output_dir: str) -> list:
     os.makedirs(output_dir, exist_ok=True)
     written = []
     for eid, entity in entities.items():
-        out_path = os.path.join(output_dir, f"{eid}.md")
+        fname = f"{entity.slug}.md" if entity.slug else f"{eid}.md"
+        out_path = os.path.join(output_dir, fname)
         content = render_page(entity, graph[eid], entities, existing_path=out_path)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            raise RewriteError(f"Cannot write {out_path}: {e}") from e
         written.append(out_path)
+
+    logger.info("Wrote %d pages to %s", len(written), output_dir)
     return written
 
 
@@ -117,6 +106,7 @@ if __name__ == "__main__":
     from extractor import extract_all
     from graph import build_graph
 
+    logging.basicConfig(level=logging.INFO)
     ents = extract_all("raw_notes")
     g = build_graph(ents)
     paths = compile_pages(ents, g, "compiled_wiki")

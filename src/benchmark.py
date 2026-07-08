@@ -1,28 +1,25 @@
 """
 benchmark.py
 
-Runs the full compile pipeline (generate -> extract -> graph -> rewrite ->
-lint) at a chosen file count and reports real wall-clock timing per stage.
-No estimation, no extrapolation -- every number printed here comes directly
-from time.perf_counter() on this run.
-
-Usage:
-    python3 benchmark.py --files 1000
-    python3 benchmark.py --files 100 --files 1000 --files 5000
+Runs the full compile pipeline at a chosen file count and reports
+real wall-clock timing per stage.
 """
 
 import argparse
+import logging
 import os
 import platform
 import shutil
 import sys
 import time
 
-from generator import generate_corpus
 from extractor import extract_all
+from generator import generate_corpus
 from graph import build_graph
-from rewriter import compile_pages
 from linter import lint
+from rewriter import compile_pages
+
+logger = logging.getLogger(__name__)
 
 
 def run_benchmark(num_files: int, seed: int = 42, tmp_root: str = "bench_tmp") -> dict:
@@ -61,8 +58,8 @@ def run_benchmark(num_files: int, seed: int = 42, tmp_root: str = "bench_tmp") -
         "graph_s": t3 - t2,
         "rewrite_s": t4 - t3,
         "lint_s": t5 - t4,
-        "compile_total_s": t4 - t1,   # extract + graph + rewrite, excludes data generation
-        "full_pipeline_s": t5 - t1,   # extract + graph + rewrite + lint
+        "compile_total_s": t4 - t1,
+        "full_pipeline_s": t5 - t1,
         "broken_links": len(report.broken_links),
         "orphan_pages": len(report.orphan_pages),
     }
@@ -81,10 +78,12 @@ def print_result(r: dict) -> None:
     print()
 
 
-def main():
+def main() -> list:
     parser = argparse.ArgumentParser(description="Benchmark the wiki compiler pipeline.")
-    parser.add_argument("--files", type=int, action="append", default=None,
-                         help="Number of files to benchmark at. Can be passed multiple times.")
+    parser.add_argument(
+        "--files", type=int, action="append", default=None,
+        help="Number of files to benchmark at. Can be passed multiple times.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -105,4 +104,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
     main()

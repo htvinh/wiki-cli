@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiki-cli"
+version = "1.0.0"
+description = "Compile raw notes (txt, md, docx, pdf, html, ...) into a linked, linted markdown wiki"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Emmimal Alexander" }]
+dependencies = ["markitdown>=0.1"]
+keywords = ["wiki", "compiler", "notes", "markdown"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Markup",
+]
+
+[project.scripts]
+wiki-cli = "src.compiler:main"
+
+[project.optional-dependencies]
+dev = ["ruff", "mypy", "markitdown"]
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/__init__.py" = ["E402"]
+"src/init.py" = ["E402"]
+"src/tests.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true

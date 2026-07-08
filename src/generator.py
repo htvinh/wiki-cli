@@ -1,18 +1,17 @@
 """
 generator.py
 
-Produces a synthetic corpus of raw, unstructured text files that stand in for
-a local Karpathy-style note dump: no headers guaranteed, inconsistent metadata
-placement, entity names mentioned inline in prose. This is the "before" state
-the compiler pipeline has to work with.
-
-Deterministic: same seed always produces the same corpus, so benchmark runs
-and article numbers are reproducible.
+Produces a synthetic corpus of raw, unstructured text files.
+Deterministic: same seed always produces the same corpus.
 """
 
+import logging
 import os
 import random
 
+from exceptions import RewriteError
+
+logger = logging.getLogger(__name__)
 
 TOPIC_POOL = [
     "Gradient Descent", "Attention Mechanism", "Tokenization", "Embedding Layer",
@@ -53,20 +52,9 @@ def _slugify(name: str) -> str:
 
 
 def generate_corpus(output_dir: str, num_files: int, seed: int = 42) -> list:
-    """
-    Writes num_files raw .txt files into output_dir. Returns the list of
-    file paths written. Deterministic given the same seed and num_files.
-    """
     rng = random.Random(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Cycle through the topic pool, appending a numeric suffix once we
-    # exhaust unique topics, so num_files can exceed len(TOPIC_POOL).
-    # Build the full topic list up front so relation targets can be drawn
-    # from the entire generated corpus, not just the fixed base pool --
-    # otherwise every "v2"/"v3" variant would be unreferenceable by
-    # construction, and orphan rate would just measure pool exhaustion
-    # rather than anything about the linking logic.
     all_topics = []
     for i in range(num_files):
         base_topic = TOPIC_POOL[i % len(TOPIC_POOL)]
@@ -75,24 +63,19 @@ def generate_corpus(output_dir: str, num_files: int, seed: int = 42) -> list:
         all_topics.append(topic)
 
     written = []
-    for i, topic in enumerate(all_topics):
+    for topic in all_topics:
         slug = _slugify(topic)
 
-        # Pick 1-3 related entities to mention in the body, deterministically,
-        # drawn from the full corpus so connectivity scales with num_files.
         others = [t for t in all_topics if t != topic]
         k = min(rng.randint(1, 3), len(others)) if others else 0
         related = rng.sample(others, k=k) if k else []
 
         lines = []
-        # Deliberately inconsistent header style: some files use '#', some
-        # use a plain capitalized line, mimicking a real raw note dump.
         if rng.random() < 0.5:
             lines.append(f"# {topic}")
         else:
             lines.append(topic.upper())
 
-        # Metadata is scattered, not in a fixed schema.
         if rng.random() < 0.7:
             lines.append(f"created: 2026-0{rng.randint(1,6)}-{rng.randint(10,28)}")
         if rng.random() < 0.4:
@@ -107,13 +90,18 @@ def generate_corpus(output_dir: str, num_files: int, seed: int = 42) -> list:
 
         content = "\n".join(lines) + "\n"
         path = os.path.join(output_dir, f"{slug}.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            raise RewriteError(f"Cannot write {path}: {e}") from e
         written.append(path)
 
+    logger.info("Generated %d files in %s (seed=%d)", num_files, output_dir, seed)
     return written
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     paths = generate_corpus("raw_notes", num_files=20, seed=42)
     print(f"Wrote {len(paths)} raw files to raw_notes/")

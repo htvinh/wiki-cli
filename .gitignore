@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+raw_notes/
+compiled_wiki/
+bench_tmp/
+.ruff_cache/
+.mypy_cache/
+./datasets/
