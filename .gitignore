@@ -8,4 +8,4 @@ compiled_wiki/
 bench_tmp/
 .ruff_cache/
 .mypy_cache/
-./datasets/
+datasets/
