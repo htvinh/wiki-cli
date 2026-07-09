@@ -60,7 +60,6 @@ from store import (
     Store,
     make_entity_id,
 )
-from watcher import watch
 
 __all__ = [
     "ChangeDetector",
@@ -70,7 +69,6 @@ __all__ = [
     "CompileStats",
     "Compiler",
     "CompilerConfig",
-    "watch",
     "CompilePlanner",
     "compile_wiki",
     "Extractor",

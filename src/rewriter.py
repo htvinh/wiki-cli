@@ -51,8 +51,8 @@ def render_page(entity, graph_edges: dict, entities: dict, existing_path: str | 
     outgoing = sorted(graph_edges["outgoing"])
     if outgoing:
         for target_id in outgoing:
-            target_name = entities[target_id].name
-            lines.append(f"- [[{target_name}]]")
+            target = entities[target_id]
+            lines.append(f"- [{target.name}]({target.slug}.md)")
     else:
         lines.append("- (no outgoing references found)")
     lines.append("")
@@ -61,10 +61,10 @@ def render_page(entity, graph_edges: dict, entities: dict, existing_path: str | 
     incoming = sorted(graph_edges["incoming"])
     if incoming:
         for source_id in incoming:
-            source_name = entities[source_id].name
-            lines.append(f"- [[{source_name}]]")
+            source = entities[source_id]
+            lines.append(f"- [{source.name}]({source.slug}.md)")
     else:
-        lines.append("- (orphan: no other page links here)")
+        lines.append("- (no other pages link here)")
     lines.append("")
 
     lines.append("## Body")
@@ -84,12 +84,62 @@ def render_page(entity, graph_edges: dict, entities: dict, existing_path: str | 
     return content
 
 
-def compile_pages(entities: dict, graph: dict, output_dir: str) -> list:
+def _write_index(output_dir: str) -> None:
+    dir_entries: dict[str, list[str]] = {}
+    for root, dirs, files in os.walk(output_dir):
+        rel = os.path.normpath(os.path.relpath(root, output_dir))
+        dir_entries.setdefault(rel, [])
+        dir_entries[rel].extend(
+            f for f in files if f.endswith(".md") and f != "index.md"
+        )
+        for d in dirs:
+            dir_entries.setdefault(os.path.normpath(os.path.join(rel, d)), [])
+
+    topo = sorted(dir_entries, key=lambda p: p.count(os.sep), reverse=True)
+    for rel_path in topo:
+        entries = dir_entries[rel_path]
+        sub_dirs = sorted(
+            d for d in dir_entries
+            if d != "." and (
+                os.path.dirname(d) == rel_path
+                or (rel_path == "." and os.path.dirname(d) == "")
+            )
+        )
+        if not entries and not sub_dirs:
+            continue
+        lines = ["# Wiki Index", ""]
+        for fn in sorted(entries):
+            name = os.path.splitext(fn)[0]
+            lines.append(f"- [{name}]({fn})")
+        for sub in sub_dirs:
+            sub_rel = os.path.relpath(sub, rel_path) if rel_path != "." else sub
+            lines.append(f"- [{os.path.basename(sub)}]({sub_rel}/index.md)")
+        lines.append("")
+        idx_dir = output_dir if rel_path == "." else os.path.join(output_dir, rel_path)
+        os.makedirs(idx_dir, exist_ok=True)
+        idx_path = os.path.join(idx_dir, "index.md")
+        try:
+            with open(idx_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines))
+        except OSError as e:
+            raise RewriteError(f"Cannot write {idx_path}: {e}")
+
+
+def compile_pages(entities: dict, graph: dict, output_dir: str,
+                  raw_dir: str = "") -> list:
     os.makedirs(output_dir, exist_ok=True)
+    abs_raw = os.path.abspath(raw_dir) if raw_dir else ""
     written = []
     for eid, entity in entities.items():
         fname = f"{entity.slug}.md" if entity.slug else f"{eid}.md"
-        out_path = os.path.join(output_dir, fname)
+        if abs_raw and entity.source_path.startswith(abs_raw):
+            rel = os.path.relpath(os.path.dirname(entity.source_path), abs_raw)
+            subdir = rel if rel != "." else ""
+        else:
+            subdir = ""
+        out_subdir = os.path.join(output_dir, subdir) if subdir else output_dir
+        os.makedirs(out_subdir, exist_ok=True)
+        out_path = os.path.join(out_subdir, fname)
         content = render_page(entity, graph[eid], entities, existing_path=out_path)
         try:
             with open(out_path, "w", encoding="utf-8") as f:
@@ -98,6 +148,7 @@ def compile_pages(entities: dict, graph: dict, output_dir: str) -> list:
             raise RewriteError(f"Cannot write {out_path}: {e}") from e
         written.append(out_path)
 
+    _write_index(output_dir)
     logger.info("Wrote %d pages to %s", len(written), output_dir)
     return written
 

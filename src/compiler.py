@@ -9,13 +9,21 @@ import argparse
 import hashlib
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from typing import Generator, Iterator
+from typing import Generator
 
 from extractor import Entity, extract_all, extract_entity
-from graph import GraphBuilder, WordIndexGraphBuilder, build_graph
+from graph import (
+    GraphBuilder,
+    GraphReport,
+    WordIndexGraphBuilder,
+    build_graph,
+    build_navigation_edges,
+    graph_report,
+)
 from linter import LintReport, lint, print_report
 from rewriter import compile_pages
 from source import FilesystemProvider, SourceProvider
@@ -103,7 +111,7 @@ class CompileStats:
     cache_misses: int = 0
     cache_hit_ratio: float = 0.0
     broken_links: int = 0
-    orphans: int = 0
+    lexical_unlinked: int = 0
     elapsed_s: float = 0.0
     entities_per_sec: float = 0.0
     pages_per_sec: float = 0.0
@@ -121,6 +129,7 @@ class CompileResult:
     pages_written: int
     lint_report: LintReport | None
     stats: CompileStats
+    graph_report: GraphReport | None = None
 
 
 @dataclass
@@ -130,7 +139,7 @@ class CompilerConfig:
     lint: bool = True
     incremental: bool = True
     parallel: bool = False
-    watch: bool = False
+    navigation_hubs: int = 0
     source_provider: SourceProvider | None = None
     extractors: list | None = None
     renderers: list | None = None
@@ -204,9 +213,10 @@ class CompilePlanner:
         self.config = config or CompilerConfig()
         self._store = store
         self._detector = ChangeDetector(store) if store else None
+        nav = self.config.navigation_hubs
         self._graph_builder = (
             graph_builder
-            or (WordIndexGraphBuilder() if store else None)
+            or (WordIndexGraphBuilder(navigation_hubs=nav) if store else None)
         )
 
     def detect_changes(self, source_provider: SourceProvider,
@@ -246,11 +256,15 @@ class CompilePlanner:
         if self._graph_builder and self._store and changes is not None:
             result = self._graph_builder.build(changes, self._store, entities)
             return result.graph
-        return build_graph(entities)
+        g = build_graph(entities)
+        if self.config.navigation_hubs > 0:
+            g = build_navigation_edges(g, entities,
+                                       top_n=self.config.navigation_hubs)
+        return g
 
     def render(self, entities: dict[str, Entity], graph: dict,
-               output_dir: str) -> list[str]:
-        return compile_pages(entities, graph, output_dir)
+               output_dir: str, raw_dir: str = "") -> list[str]:
+        return compile_pages(entities, graph, output_dir, raw_dir)
 
     def validate(self, output_dir: str) -> LintReport:
         return lint(output_dir)
@@ -275,6 +289,7 @@ class Compiler:
         else:
             self.planner = CompilePlanner(config=self.config, store=store,
                                           graph_builder=graph_builder)
+        self._result: CompileResult | None = None
         self._plugins = self._collect_plugins()
 
     def _collect_plugins(self) -> list:
@@ -299,11 +314,13 @@ class Compiler:
     def compile(self, raw_dir: str, output_dir: str) -> CompileResult:
         for _ in self.compile_events(raw_dir, output_dir):
             pass
+        assert self._result is not None
         return self._result
 
     def compile_events(
         self, raw_dir: str, output_dir: str
     ) -> Generator[CompileEvent, None, CompileResult]:
+        self._last_entities: dict | None = None
         provider = self._resolve_provider()
         start = time.perf_counter()
 
@@ -337,6 +354,7 @@ class Compiler:
             t0 = time.perf_counter()
             yield CompileEvent("phase_start", "extract", t0)
             entities = self.planner.extract(provider, raw_dir, changes)
+            self._last_entities = entities
             for eid in entities:
                 yield CompileEvent("extracted", "extract",
                                    time.perf_counter(), entity_id=eid)
@@ -357,7 +375,7 @@ class Compiler:
             # render
             t0 = time.perf_counter()
             yield CompileEvent("phase_start", "render", t0)
-            written = self.planner.render(entities, graph, output_dir)
+            written = self.planner.render(entities, graph, output_dir, raw_dir)
             for path in written:
                 yield CompileEvent("written", "render",
                                    time.perf_counter(),
@@ -376,10 +394,13 @@ class Compiler:
                 yield CompileEvent("lint_result", "lint", time.perf_counter(),
                                    payload={
                                        "broken": len(lint_report.broken_links),
-                                       "orphans": len(lint_report.orphan_pages),
+                                        "lexical_unlinked": len(lint_report.lexical_unlinked_pages),
                                    })
                 yield CompileEvent("phase_end", "lint", time.perf_counter(),
                                    elapsed=time.perf_counter() - t0)
+
+            # graph report
+            g_report = graph_report(graph, entities)
 
             # done
             elapsed = time.perf_counter() - start
@@ -396,8 +417,8 @@ class Compiler:
                 deleted=len(changes.deleted),
                 broken_links=(len(lint_report.broken_links)
                               if lint_report else 0),
-                orphans=(len(lint_report.orphan_pages)
-                         if lint_report else 0),
+                lexical_unlinked=(len(lint_report.lexical_unlinked_pages)
+                                  if lint_report else 0),
                 elapsed_s=elapsed,
                 entities_per_sec=(len(entities) / elapsed
                                   if elapsed > 0 else 0.0),
@@ -409,6 +430,7 @@ class Compiler:
                 pages_written=len(written),
                 lint_report=lint_report,
                 stats=stats,
+                graph_report=g_report,
             )
             self._result = result
             return result
@@ -416,13 +438,6 @@ class Compiler:
         finally:
             for p in reversed(self._plugins):
                 p.shutdown()
-
-    def watch(self, raw_dir: str, output_dir: str,
-              poll_interval: float = 1.0,
-              max_cycles: int | None = None) -> Iterator[CompileEvent]:
-        from watcher import watch as _watch
-        yield from _watch(self, raw_dir, output_dir, poll_interval, max_cycles)
-
 
 # ── Backward-compat wrapper ──────────────────────────────────────────
 
@@ -451,15 +466,16 @@ def main() -> int:
         description="Compile raw notes into a linked markdown wiki."
     )
     parser.add_argument("raw_dir", help="Directory of raw source files")
-    parser.add_argument("output_dir", help="Directory to write compiled .md pages into")
+    parser.add_argument("output_dir", nargs="?", default=None,
+                        help="Directory to write compiled .md pages into (default: raw_dir-wiki)")
     parser.add_argument("--no-lint", action="store_true", help="Skip the lint pass")
-    parser.add_argument("--watch", "-w", action="store_true",
-                        help="Watch for file changes and recompile automatically")
-    parser.add_argument("--poll-interval", type=float, default=1.0,
-                        help="Polling interval in seconds (default: 1.0)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel extraction workers (default: 1)")
+    parser.add_argument("--report", action="store_true",
+                        help="Print graph report after compilation")
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = args.raw_dir.rstrip("/") + "-wiki"
 
     config = CompilerConfig(
         lint=not args.no_lint,
@@ -467,27 +483,28 @@ def main() -> int:
     )
     compiler = Compiler(config=config)
 
-    if args.watch:
-        print(f"Watching {args.raw_dir} for changes (every {args.poll_interval}s)...")
-        try:
-            for event in compiler.watch(args.raw_dir, args.output_dir,
-                                        poll_interval=args.poll_interval):
-                if event.event == "done":
-                    print(f"→ Recompiled ({time.strftime('%H:%M:%S')})")
-                elif event.event == "watch_recompile":
-                    changed = (event.payload or {}).get("changed", [])
-                    print(f"Detected {len(changed)} change(s), recompiling...")
-        except KeyboardInterrupt:
-            print("\nWatch stopped.")
-        return 0
-
-    result = compiler.compile(args.raw_dir, args.output_dir)
+    progress_chars = 0
+    for event in compiler.compile_events(args.raw_dir, args.output_dir):
+        if event.event == "extracted":
+            sys.stdout.write(".")
+            sys.stdout.flush()
+            progress_chars += 1
+        elif event.event == "phase_end" and event.phase == "extract":
+            if progress_chars > 0:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+    result = compiler._result
+    assert result is not None
     print(
         f"Compiled {result.pages_written} pages "
         f"from {args.raw_dir} -> {args.output_dir}"
     )
     if result.lint_report:
         print_report(result.lint_report)
+    if args.report and result.graph_report:
+        from graph import print_graph_report
+        print_graph_report(result.graph_report,
+                           entities=compiler._last_entities)
     return 0
 
 

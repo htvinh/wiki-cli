@@ -106,13 +106,12 @@ class ConvertingDocument(Document):
 class FilesystemProvider(SourceProvider):
     def iter_documents(self, raw_dir: str) -> Generator[Document, None, None]:
         try:
-            fnames = sorted(os.listdir(raw_dir))
+            for root, _dirs, files in os.walk(raw_dir):
+                for fname in sorted(files):
+                    path = os.path.join(root, fname)
+                    if fname.endswith(".txt") or fname.endswith(".md"):
+                        yield FilesystemDocument(path)
+                    elif needs_conversion(path):
+                        yield ConvertingDocument(path)
         except OSError as e:
-            logger.warning("Cannot list directory %s: %s", raw_dir, e)
-            return
-        for fname in fnames:
-            path = os.path.join(raw_dir, fname)
-            if fname.endswith(".txt") or fname.endswith(".md"):
-                yield FilesystemDocument(path)
-            elif needs_conversion(path):
-                yield ConvertingDocument(path)
+            logger.warning("Cannot walk directory %s: %s", raw_dir, e)

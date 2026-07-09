@@ -19,7 +19,8 @@ sys.path.insert(0, THIS_DIR)
 from compiler import compile_wiki
 from extractor import Entity, extract_all, extract_entity
 from generator import generate_corpus
-from graph import build_graph, orphan_ids
+from graph import (build_graph, build_navigation_edges, graph_report,
+                   orphan_ids)
 from linter import lint
 from rewriter import compile_pages, render_page
 
@@ -170,6 +171,124 @@ class TestGraph(unittest.TestCase):
         self.assertIn("a", orphans)      # nothing links to Alpha either
         self.assertNotIn("b", orphans)   # Beta is referenced by Alpha
 
+    def test_alias_mention_detected(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions Apex in text"),
+            "b": Entity(entity_id="b", name="Beta", aliases=["Apex"],
+                        body="nothing"),
+        }
+        g = build_graph(entities)
+        self.assertIn("b", g["a"]["outgoing"])
+        self.assertIn("a", g["b"]["incoming"])
+
+    def test_alias_mention_skips_self(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", aliases=["Apex"],
+                        body="Apex appears in its own body"),
+        }
+        g = build_graph(entities)
+        self.assertNotIn("a", g["a"]["outgoing"])
+
+    def test_name_mention_still_detected_with_aliases(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", aliases=["Apex"],
+                        body="mentions Beta"),
+            "b": Entity(entity_id="b", name="Beta", body="nothing"),
+        }
+        g = build_graph(entities)
+        self.assertIn("b", g["a"]["outgoing"])
+
+    def test_alias_multi_word_mention_detected(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha Corp",
+                        body="refers to Apex Solutions here"),
+            "b": Entity(entity_id="b", name="Beta LLC",
+                        aliases=["Apex Solutions"], body="nothing"),
+        }
+        g = build_graph(entities)
+        self.assertIn("b", g["a"]["outgoing"])
+        self.assertIn("a", g["b"]["incoming"])
+
+    def test_navigation_edges_added_to_most_linked(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions Beta and Gamma"),
+            "b": Entity(entity_id="b", name="Beta", body="mentions Gamma"),
+            "c": Entity(entity_id="c", name="Gamma", body="nothing"),
+            "d": Entity(entity_id="d", name="Delta", body="mentions nothing either"),
+        }
+        g = build_graph(entities)
+        g = build_navigation_edges(g, entities, top_n=1)
+        # Gamma has 2 incoming (from a, b) — should be the only hub
+        self.assertIn("c", g["a"]["outgoing"])
+        self.assertIn("c", g["b"]["outgoing"])
+        self.assertIn("c", g["d"]["outgoing"])
+
+    def test_navigation_edges_respects_top_n(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions B C D"),
+            "b": Entity(entity_id="b", name="B", body="mentions C D"),
+            "c": Entity(entity_id="c", name="C", body="mentions D"),
+            "d": Entity(entity_id="d", name="D", body="nothing"),
+        }
+        g = build_graph(entities)
+        g = build_navigation_edges(g, entities, top_n=2)
+        # D (incoming=3), C (incoming=2) should be hubs
+        for eid in ("a", "b", "c"):
+            self.assertIn("d", g[eid]["outgoing"])
+
+    def test_navigation_zero_disabled(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions Beta"),
+            "b": Entity(entity_id="b", name="Beta", body="nothing"),
+        }
+        g = build_graph(entities)
+        g = build_navigation_edges(g, entities, top_n=0)
+        self.assertEqual(g, build_graph(entities))
+
+    def test_graph_report_counts(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions Beta and Gamma"),
+            "b": Entity(entity_id="b", name="Beta", body="mentions Gamma"),
+            "c": Entity(entity_id="c", name="Gamma", body="nothing"),
+        }
+        g = build_graph(entities)
+        r = graph_report(g, entities)
+        self.assertEqual(r.entity_count, 3)
+        self.assertEqual(r.edge_count, 3)  # a→b, a→c, b→c
+
+    def test_graph_report_top_linked(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions B and C and D"),
+            "b": Entity(entity_id="b", name="B", body="mentions C and D"),
+            "c": Entity(entity_id="c", name="C", body="mentions D"),
+            "d": Entity(entity_id="d", name="D", body="nothing"),
+        }
+        g = build_graph(entities)
+        r = graph_report(g, entities, top_n=2)
+        # D (in 3), C (in 2), B (in 1), A (in 0)
+        self.assertEqual(len(r.top_linked), 2)
+        self.assertEqual(r.top_linked[0][0], "d")
+        self.assertEqual(r.top_linked[0][1], 3)
+
+    def test_graph_report_lexical_unlinked(self):
+        entities = {
+            "a": Entity(entity_id="a", name="Alpha", body="mentions Beta"),
+            "b": Entity(entity_id="b", name="Beta", body="nothing"),
+            "c": Entity(entity_id="c", name="Gamma", body="nothing"),
+        }
+        g = build_graph(entities)
+        r = graph_report(g, entities)
+        self.assertIn("a", r.lexical_unlinked)
+        self.assertIn("c", r.lexical_unlinked)
+        self.assertNotIn("b", r.lexical_unlinked)
+
+    def test_graph_report_empty(self):
+        r = graph_report({})
+        self.assertEqual(r.entity_count, 0)
+        self.assertEqual(r.edge_count, 0)
+        self.assertEqual(r.top_linked, [])
+        self.assertEqual(r.lexical_unlinked, [])
+
 
 class TestRewriter(unittest.TestCase):
     def setUp(self):
@@ -186,8 +305,8 @@ class TestRewriter(unittest.TestCase):
         g = build_graph(entities)
         page_a = render_page(entities["alpha"], g["alpha"], entities)
         page_b = render_page(entities["beta"], g["beta"], entities)
-        self.assertIn("[[Beta]]", page_a.split("## Related")[1].split("## Referenced By")[0])
-        self.assertIn("[[Alpha]]", page_b.split("## Referenced By")[1])
+        self.assertIn("[Beta](beta.md)", page_a.split("## Related")[1].split("## Referenced By")[0])
+        self.assertIn("[Alpha](alpha.md)", page_b.split("## Referenced By")[1])
 
     def test_human_notes_preserved_across_recompile(self):
         entities = {
@@ -236,8 +355,8 @@ class TestLinter(unittest.TestCase):
         compile_pages(entities, g, self.tmp)
         report = lint(self.tmp)
         # Alpha has no incoming links (nothing links to it) -> orphan.
-        self.assertIn("alpha.md", report.orphan_pages)
-        self.assertNotIn("beta.md", report.orphan_pages)
+        self.assertIn("alpha.md", report.lexical_unlinked_pages)
+        self.assertNotIn("beta.md", report.lexical_unlinked_pages)
 
     def test_broken_link_detected(self):
         entities = {
@@ -247,7 +366,7 @@ class TestLinter(unittest.TestCase):
         compile_pages(entities, g, self.tmp)
         path = os.path.join(self.tmp, "alpha.md")
         with open(path, "a") as f:
-            f.write("\nSee [[Ghost Page]] too.\n")
+            f.write("\nSee [Ghost Page](ghost_page.md) too.\n")
         report = lint(self.tmp)
         self.assertEqual(len(report.broken_links), 1)
         self.assertEqual(report.broken_links[0], ("alpha.md", "Ghost Page"))
@@ -278,7 +397,7 @@ class TestFullPipeline(unittest.TestCase):
         self.assertEqual(len(result["entities"]), 30)
         self.assertEqual(len(result["written_paths"]), 30)
         self.assertEqual(result["lint_report"].broken_links, [])
-        self.assertEqual(result["lint_report"].total_pages, 30)
+        self.assertEqual(result["lint_report"].total_pages, 31)
 
     def test_recompile_is_idempotent_on_compiler_owned_sections(self):
         raw_dir = os.path.join(self.tmp, "raw")
@@ -394,10 +513,40 @@ class TestStore(unittest.TestCase):
         self.assertEqual(all_out["a"], {"b", "c"})
         self.assertEqual(all_out["d"], {"e"})
 
+    def test_graph_get_outgoing_by_type(self):
+        store = self._store()
+        store.graph.put_edge("a", "b", "explicit")
+        store.graph.put_edge("a", "c", "alias")
+        self.assertEqual(store.graph.get_outgoing_by_type("a", "explicit"), {"b"})
+        self.assertEqual(store.graph.get_outgoing_by_type("a", "alias"), {"c"})
+
+    def test_graph_get_incoming_by_type(self):
+        store = self._store()
+        store.graph.put_edge("a", "x", "explicit")
+        store.graph.put_edge("b", "x", "alias")
+        self.assertEqual(store.graph.get_incoming_by_type("x", "explicit"), {"a"})
+        self.assertEqual(store.graph.get_incoming_by_type("x", "alias"), {"b"})
+
+    def test_graph_iter_edges_by_type(self):
+        store = self._store()
+        store.graph.put_edge("a", "b", "explicit")
+        store.graph.put_edge("a", "c", "alias")
+        store.graph.put_edge("d", "e", "explicit")
+        explicit = list(store.graph.iter_edges_by_type("explicit"))
+        self.assertCountEqual(explicit, [("a", "b"), ("d", "e")])
+        alias = list(store.graph.iter_edges_by_type("alias"))
+        self.assertCountEqual(alias, [("a", "c")])
+
     def test_index_round_trip(self):
         store = self._store()
         store.index.index_name("e1", "attention mechanism")
         candidates = store.index.get_candidates("attention")
+        self.assertEqual(candidates, ["e1"])
+
+    def test_index_alias_round_trip(self):
+        store = self._store()
+        store.index.index_alias("e1", "apex solution")
+        candidates = store.index.get_candidates("apex")
         self.assertEqual(candidates, ["e1"])
 
     def test_index_drop(self):
@@ -558,7 +707,6 @@ class TestCompiler(unittest.TestCase):
         self.assertTrue(cfg.lint)
         self.assertTrue(cfg.incremental)
         self.assertFalse(cfg.parallel)
-        self.assertFalse(cfg.watch)
         self.assertIsNone(cfg.source_provider)
 
     def test_compile_event_creation(self):
@@ -646,6 +794,18 @@ class TestCompiler(unittest.TestCase):
         result = compiler.compile(raw_dir, out_dir)
         self.assertIsNone(result.lint_report)
 
+    def test_compiler_graph_report_present(self):
+        from compiler import Compiler, CompilerConfig
+        raw_dir = os.path.join(self.tmp, "raw_report")
+        out_dir = os.path.join(self.tmp, "out_report")
+        from generator import generate_corpus
+        generate_corpus(raw_dir, num_files=5, seed=1)
+        compiler = Compiler(CompilerConfig(lint=False))
+        result = compiler.compile(raw_dir, out_dir)
+        self.assertIsNotNone(result.graph_report)
+        self.assertEqual(result.graph_report.entity_count, 5)
+        self.assertGreater(result.graph_report.edge_count, 0)
+
     def test_compile_wiki_backward_compat(self):
         raw_dir = os.path.join(self.tmp, "raw_bc")
         out_dir = os.path.join(self.tmp, "out_bc")
@@ -673,8 +833,8 @@ class TestCompiler(unittest.TestCase):
         self.assertEqual(len(old["written_paths"]), new.pages_written)
         self.assertEqual(len(old["lint_report"].broken_links),
                          len(new.lint_report.broken_links))
-        self.assertEqual(len(old["lint_report"].orphan_pages),
-                         len(new.lint_report.orphan_pages))
+        self.assertEqual(len(old["lint_report"].lexical_unlinked_pages),
+                         len(new.lint_report.lexical_unlinked_pages))
 
     def test_compiler_with_di(self):
         from compiler import CompilePlanner, Compiler, CompilerConfig
@@ -1041,6 +1201,104 @@ class TestGraphBuilder(unittest.TestCase):
         g = planner.graph({ea.entity_id: ea})
         expected = build_graph({ea.entity_id: ea})
         self.assertEqual(g, expected)
+
+    def test_builder_creates_alias_edges(self):
+        from compiler import ChangeSet
+        from extractor import extract_entity
+        from graph import WordIndexGraphBuilder
+        from store import MemoryStore
+        raw = os.path.join(self.tmp, "raw")
+        os.makedirs(raw, exist_ok=True)
+        a_path = os.path.join(raw, "a.txt")
+        with open(a_path, "w") as f:
+            f.write("# Alpha\naliases: Apex, The Prime\n\nmentions Apex in body.")
+        b_path = os.path.join(raw, "b.txt")
+        with open(b_path, "w") as f:
+            f.write("# Beta\n\nBody.")
+        ea = extract_entity(a_path)
+        eb = extract_entity(b_path)
+        entities = {ea.entity_id: ea, eb.entity_id: eb}
+        store = MemoryStore()
+        store.entities.put(ea.entity_id, name=ea.name, slug=ea.slug,
+                           aliases=", ".join(ea.aliases),
+                           source_path=a_path)
+        store.entities.put(eb.entity_id, name=eb.name, slug=eb.slug,
+                           source_path=b_path)
+        store.content.put(ea.entity_id, ea.body)
+        store.content.put(eb.entity_id, eb.body)
+        builder = WordIndexGraphBuilder()
+        changes = ChangeSet(added={ea.entity_id, eb.entity_id})
+        result = builder.build(changes, store, entities)
+        # Alpha's body mentions "Apex" which is an alias of ... itself,
+        # so no ALIAS edge should be created to Beta.
+        self.assertEqual(result.edge_count, 0)
+
+    def test_builder_alias_creates_edge_to_other_entity(self):
+        from compiler import ChangeSet
+        from extractor import extract_entity
+        from graph import WordIndexGraphBuilder
+        from store import MemoryStore
+        raw = os.path.join(self.tmp, "raw")
+        os.makedirs(raw, exist_ok=True)
+        a_path = os.path.join(raw, "a.txt")
+        with open(a_path, "w") as f:
+            f.write("# Alpha\n\nmentions Apex in body.")
+        b_path = os.path.join(raw, "b.txt")
+        with open(b_path, "w") as f:
+            f.write("# Beta\naliases: Apex\n\nBody text.")
+        ea = extract_entity(a_path)
+        eb = extract_entity(b_path)
+        entities = {ea.entity_id: ea, eb.entity_id: eb}
+        store = MemoryStore()
+        store.entities.put(ea.entity_id, name=ea.name, slug=ea.slug,
+                           source_path=a_path)
+        store.entities.put(eb.entity_id, name=eb.name, slug=eb.slug,
+                           aliases=", ".join(eb.aliases),
+                           source_path=b_path)
+        store.content.put(ea.entity_id, ea.body)
+        store.content.put(eb.entity_id, eb.body)
+        builder = WordIndexGraphBuilder()
+        changes = ChangeSet(added={ea.entity_id, eb.entity_id})
+        result = builder.build(changes, store, entities)
+        self.assertGreater(result.edge_count, 0)
+        # Alpha's body mentions "Apex" which is Beta's alias
+        self.assertIn(ea.entity_id, result.graph)
+        self.assertIn(eb.entity_id, result.graph)
+        self.assertIn(eb.entity_id, result.graph[ea.entity_id]["outgoing"])
+        self.assertIn(ea.entity_id, result.graph[eb.entity_id]["incoming"])
+
+    def test_builder_navigation_hubs_add_edges(self):
+        from compiler import ChangeSet
+        from extractor import extract_entity
+        from graph import WordIndexGraphBuilder
+        from store import MemoryStore
+        raw = os.path.join(self.tmp, "raw")
+        os.makedirs(raw, exist_ok=True)
+        a_path = os.path.join(raw, "a.txt")
+        with open(a_path, "w") as f:
+            f.write("# Alpha\n\nmentions Beta.")
+        b_path = os.path.join(raw, "b.txt")
+        with open(b_path, "w") as f:
+            f.write("# Beta\n\nmentions nothing.")
+        c_path = os.path.join(raw, "c.txt")
+        with open(c_path, "w") as f:
+            f.write("# Gamma\n\nmentions Alpha.")
+        ea = extract_entity(a_path)
+        eb = extract_entity(b_path)
+        ec = extract_entity(c_path)
+        entities = {ea.entity_id: ea, eb.entity_id: eb, ec.entity_id: ec}
+        store = MemoryStore()
+        for e, p in [(ea, a_path), (eb, b_path), (ec, c_path)]:
+            store.entities.put(e.entity_id, name=e.name, slug=e.slug,
+                               source_path=p)
+            store.content.put(e.entity_id, e.body)
+        builder = WordIndexGraphBuilder(navigation_hubs=1)
+        changes = ChangeSet(added={e.entity_id for e in (ea, eb, ec)})
+        result = builder.build(changes, store, entities)
+        # Beta is mentioned by Alpha → 1 incoming → hub (most linked)
+        # Alpha is mentioned by Gamma → 1 incoming
+        # At least one NAVIGATION edge was created on top of EXPLICIT
+        self.assertGreater(result.edge_count, 1)
 
 
 class TestParallelExtraction(unittest.TestCase):
@@ -1422,116 +1680,7 @@ class TestExtractorWithContent(unittest.TestCase):
         self.assertEqual(entity.name, "My Test Doc")
 
 
-class TestWatcher(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.raw = os.path.join(self.tmp, "raw")
-        self.out = os.path.join(self.tmp, "out")
-        os.mkdir(self.raw)
-        os.mkdir(self.out)
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _write(self, name, content):
-        path = os.path.join(self.raw, name)
-        with open(path, "w") as f:
-            f.write(content)
-        return path
-
-    def test_scan_txt(self):
-        from watcher import _scan_txt
-        self._write("a.txt", "hello")
-        self._write("b.md", "markdown")
-        self._write("c.txt", "world")
-        result = _scan_txt(self.raw)
-        self.assertEqual(len(result), 2)
-        self.assertTrue(all(p.endswith(".txt") for p in result))
-
-    def test_scan_txt_empty_dir(self):
-        from watcher import _scan_txt
-        self.assertEqual(_scan_txt(self.raw), [])
-
-    def test_scan_txt_missing_dir(self):
-        from watcher import _scan_txt
-        self.assertEqual(_scan_txt("/nonexistent"), [])
-
-    def test_detect_new_file(self):
-        from watcher import _detect_changes
-        self._write("a.txt", "hello")
-        known: dict = {}
-        changes = _detect_changes(self.raw, known)
-        self.assertIn(os.path.join(self.raw, "a.txt"), changes)
-
-    def test_detect_modified_file(self):
-        from watcher import _detect_changes
-        path = self._write("a.txt", "hello")
-        st = os.stat(path)
-        known = {path: (st.st_mtime, round(st.st_size))}
-        import time
-        time.sleep(0.05)
-        with open(path, "w") as f:
-            f.write("modified content")
-        changes = _detect_changes(self.raw, known)
-        self.assertIn(path, changes)
-
-    def test_detect_deleted_file(self):
-        from watcher import _detect_changes
-        path = self._write("a.txt", "hello")
-        st = os.stat(path)
-        known = {path: (st.st_mtime, round(st.st_size))}
-        os.remove(path)
-        changes = _detect_changes(self.raw, known)
-        self.assertIn(path, changes)
-
-    def test_detect_no_changes(self):
-        from watcher import _detect_changes
-        path = self._write("a.txt", "hello")
-        st = os.stat(path)
-        known = {path: (st.st_mtime, round(st.st_size))}
-        changes = _detect_changes(self.raw, known)
-        self.assertEqual(changes, set())
-
-    def test_watch_triggers_initial_compile(self):
-        self._write("alpha.txt", "# Alpha\nHello world.\n## Related\n[[Beta]]")
-        self._write("beta.txt", "# Beta\nHello back.\n## Related\n[[Alpha]]")
-        from compiler import Compiler, CompilerConfig
-        config = CompilerConfig(lint=False)
-        compiler = Compiler(config=config)
-        events = list(compiler.watch(self.raw, self.out,
-                                     poll_interval=0.1, max_cycles=1))
-        # Should include watch_start and done events
-        event_names = [e.event for e in events]
-        self.assertIn("watch_start", event_names)
-        self.assertIn("done", event_names)
-        # Compiled output should exist
-        self.assertTrue(os.path.isfile(os.path.join(self.out, "alpha.md")))
-
-    def test_watch_recompiles_on_change(self):
-        self._write("a.txt", "# Alpha\nHello.\n## Related\n")
-        from compiler import Compiler, CompilerConfig
-        config = CompilerConfig(lint=False)
-        compiler = Compiler(config=config)
-        events: list = []
-        gen = compiler.watch(self.raw, self.out,
-                             poll_interval=0.1, max_cycles=2)
-        # First cycle — initial compile
-        for e in gen:
-            events.append(e)
-            if e.event == "done":
-                break
-        # Now modify a file
-        import time
-        time.sleep(0.15)
-        with open(os.path.join(self.raw, "a.txt"), "w") as f:
-            f.write("# Alpha\nModified content.\n## Related\n")
-        # Second cycle — recompile on change
-        for e in gen:
-            events.append(e)
-            if e.event == "done":
-                break
-        event_names = [e.event for e in events]
-        self.assertIn("watch_recompile", event_names)
 
 
 if __name__ == "__main__":

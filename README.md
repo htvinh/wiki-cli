@@ -31,23 +31,29 @@ Raw Notes (.txt, .md, .docx, .pdf, .html, ...)
 ## Installation
 
 ```bash
-pip install markitdown
-git clone https://github.com/Emmimal/wiki-cli.git
+# Install from source (recommended)
+git clone https://github.com/htvinh/wiki-cli.git
 cd wiki-cli
-python src/init.py
+pip install -e ".[dev]"
+
+# Or install with pipx (CLI only)
+pipx install .
 ```
 
 ## Quick Start
 
 ```bash
+# Generate demo corpus
+python src/init.py
+
 # Compile raw notes → compiled wiki
-python src/compiler.py raw_notes/ compiled_wiki/
+wiki-cli raw_notes/ compiled_wiki/
 
 # Watch for changes
-python src/compiler.py raw_notes/ compiled_wiki/ --watch
+wiki-cli raw_notes/ compiled_wiki/ --watch
 
 # Parallel extraction (4 workers)
-python src/compiler.py raw_notes/ compiled_wiki/ --workers 4
+wiki-cli raw_notes/ compiled_wiki/ --workers 4
 ```
 
 ```python
@@ -66,7 +72,7 @@ if result.lint_report:
 ## CLI Reference
 
 ```
-python src/compiler.py raw_dir output_dir [options]
+wiki-cli raw_dir output_dir [options]
 
   raw_dir              Directory of raw source files
   output_dir           Directory to write compiled .md pages

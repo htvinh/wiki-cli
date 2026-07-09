@@ -30,6 +30,10 @@ class Entity:
     body: str = ""
     source_path: str = ""
 
+    def __post_init__(self):
+        if not self.slug and self.name:
+            self.slug = _slugify(self.name)
+
 
 def _slugify(name: str) -> str:
     return name.lower().replace(" ", "_").replace("-", "_")

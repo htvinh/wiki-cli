@@ -31,7 +31,7 @@ CURRENT_COMPILER_VERSION = "1.0.0"
 CURRENT_EXTRACTOR_VERSION = "1.0.0"
 CURRENT_TOKENIZER_VERSION = "1.0.0"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -71,7 +71,8 @@ class EntityRepo(ABC):
 
 class GraphRepo(ABC):
     @abstractmethod
-    def put_edge(self, source: str, target: str) -> None: ...
+    def put_edge(self, source: str, target: str,
+                 edge_type: str = "explicit") -> None: ...
 
     @abstractmethod
     def delete_outgoing(self, entity_id: str) -> None: ...
@@ -94,10 +95,24 @@ class GraphRepo(ABC):
     @abstractmethod
     def get_all_outgoing(self) -> dict[str, set[str]]: ...
 
+    @abstractmethod
+    def get_outgoing_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]: ...
+
+    @abstractmethod
+    def get_incoming_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]: ...
+
+    @abstractmethod
+    def iter_edges_by_type(self, edge_type: str) -> Generator[tuple[str, str], None, None]: ...
+
 
 class IndexRepo(ABC):
     @abstractmethod
     def index_name(self, entity_id: str, name: str) -> None: ...
+
+    @abstractmethod
+    def index_alias(self, entity_id: str, alias: str) -> None: ...
 
     @abstractmethod
     def drop_entity_index(self, entity_id: str) -> None: ...
@@ -212,9 +227,10 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 
 CREATE TABLE IF NOT EXISTS graph_edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    PRIMARY KEY (source, target)
+    source    TEXT NOT NULL,
+    target    TEXT NOT NULL,
+    edge_type TEXT NOT NULL DEFAULT 'explicit',
+    PRIMARY KEY (source, target, edge_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_graph_target ON graph_edges(target);
@@ -300,10 +316,11 @@ class SQLiteGraphRepo(GraphRepo):
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
 
-    def put_edge(self, source: str, target: str) -> None:
+    def put_edge(self, source: str, target: str,
+                 edge_type: str = "explicit") -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO graph_edges (source, target) VALUES (?, ?)",
-            (source, target),
+            "INSERT OR IGNORE INTO graph_edges (source, target, edge_type) VALUES (?, ?, ?)",
+            (source, target, edge_type),
         )
 
     def delete_outgoing(self, entity_id: str) -> None:
@@ -345,6 +362,30 @@ class SQLiteGraphRepo(GraphRepo):
             result.setdefault(source, set()).add(target)
         return result
 
+    def get_outgoing_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT target FROM graph_edges WHERE source = ? AND edge_type = ?",
+            (entity_id, edge_type),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_incoming_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT source FROM graph_edges WHERE target = ? AND edge_type = ?",
+            (entity_id, edge_type),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def iter_edges_by_type(self, edge_type: str) -> Generator[tuple[str, str], None, None]:
+        cursor = self._conn.execute(
+            "SELECT source, target FROM graph_edges WHERE edge_type = ?",
+            (edge_type,),
+        )
+        for row in cursor:
+            yield (row[0], row[1])
+
 
 class SQLiteIndexRepo(IndexRepo):
     def __init__(self, conn: sqlite3.Connection):
@@ -352,6 +393,15 @@ class SQLiteIndexRepo(IndexRepo):
 
     def index_name(self, entity_id: str, name: str) -> None:
         words = set(name.lower().split())
+        for word in words:
+            self._conn.execute("""
+                INSERT INTO word_index (word, entity_id, frequency, document_frequency)
+                VALUES (?, ?, 1, 1)
+                ON CONFLICT(word, entity_id) DO UPDATE SET frequency = frequency + 1
+            """, (word, entity_id))
+
+    def index_alias(self, entity_id: str, alias: str) -> None:
+        words = set(alias.lower().split())
         for word in words:
             self._conn.execute("""
                 INSERT INTO word_index (word, entity_id, frequency, document_frequency)
@@ -462,6 +512,23 @@ class SQLiteStore(Store):
         elif int(stored) < SCHEMA_VERSION:
             for v in range(int(stored) + 1, SCHEMA_VERSION + 1):
                 logger.info("Applying schema migration v%s", v)
+                if v == 2:
+                    self._conn.executescript(
+                        "ALTER TABLE graph_edges ADD COLUMN "
+                        "edge_type TEXT NOT NULL DEFAULT 'explicit';\n"
+                        "CREATE TABLE IF NOT EXISTS graph_edges_v2 (\n"
+                        "    source    TEXT NOT NULL,\n"
+                        "    target    TEXT NOT NULL,\n"
+                        "    edge_type TEXT NOT NULL DEFAULT 'explicit',\n"
+                        "    PRIMARY KEY (source, target, edge_type)\n"
+                        ");\n"
+                        "INSERT INTO graph_edges_v2 (source, target, edge_type)\n"
+                        "SELECT source, target, edge_type FROM graph_edges;\n"
+                        "DROP TABLE graph_edges;\n"
+                        "ALTER TABLE graph_edges_v2 RENAME TO graph_edges;\n"
+                        "CREATE INDEX IF NOT EXISTS idx_graph_target "
+                        "ON graph_edges(target);\n"
+                    )
             self._state_repo.set("schema_version", str(SCHEMA_VERSION))
             self._conn.commit()
 
@@ -555,39 +622,57 @@ class _MemoryEntityRepo(EntityRepo):
 
 class _MemoryGraphRepo(GraphRepo):
     def __init__(self):
-        self._out: dict[str, set[str]] = {}
-        self._in: dict[str, set[str]] = {}
+        self._edges: dict[tuple[str, str], str] = {}  # (source, target) -> edge_type
 
-    def put_edge(self, source: str, target: str) -> None:
-        self._out.setdefault(source, set()).add(target)
-        self._in.setdefault(target, set()).add(source)
+    def put_edge(self, source: str, target: str,
+                 edge_type: str = "explicit") -> None:
+        self._edges[(source, target)] = edge_type
 
     def delete_outgoing(self, entity_id: str) -> None:
-        targets = self._out.pop(entity_id, set())
-        for t in targets:
-            self._in.get(t, set()).discard(entity_id)
+        for key in list(self._edges):
+            s, t = key
+            if s == entity_id:
+                del self._edges[key]
 
     def delete_incoming(self, entity_id: str) -> None:
-        sources = self._in.pop(entity_id, set())
-        for s in sources:
-            self._out.get(s, set()).discard(entity_id)
+        for key in list(self._edges):
+            s, t = key
+            if t == entity_id:
+                del self._edges[key]
 
     def get_outgoing(self, entity_id: str) -> set[str]:
-        return set(self._out.get(entity_id, set()))
+        return {t for (s, t) in self._edges if s == entity_id}
 
     def get_incoming(self, entity_id: str) -> set[str]:
-        return set(self._in.get(entity_id, set()))
+        return {s for (s, t) in self._edges if t == entity_id}
 
     def iter_edges(self) -> Generator[tuple[str, str], None, None]:
-        for s, targets in self._out.items():
-            for t in targets:
-                yield (s, t)
+        for s, t in self._edges:
+            yield (s, t)
 
     def get_edge_count(self) -> int:
-        return sum(len(v) for v in self._out.values())
+        return len(self._edges)
 
     def get_all_outgoing(self) -> dict[str, set[str]]:
-        return {k: set(v) for k, v in self._out.items()}
+        result: dict[str, set[str]] = {}
+        for s, t in self._edges:
+            result.setdefault(s, set()).add(t)
+        return result
+
+    def get_outgoing_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]:
+        return {t for (s, t), et in self._edges.items()
+                if s == entity_id and et == edge_type}
+
+    def get_incoming_by_type(self, entity_id: str,
+                             edge_type: str) -> set[str]:
+        return {s for (s, t), et in self._edges.items()
+                if t == entity_id and et == edge_type}
+
+    def iter_edges_by_type(self, edge_type: str) -> Generator[tuple[str, str], None, None]:
+        for (s, t), et in self._edges.items():
+            if et == edge_type:
+                yield (s, t)
 
 
 class _MemoryIndexRepo(IndexRepo):
@@ -596,6 +681,10 @@ class _MemoryIndexRepo(IndexRepo):
 
     def index_name(self, entity_id: str, name: str) -> None:
         for word in set(name.lower().split()):
+            self._index.setdefault(word, set()).add(entity_id)
+
+    def index_alias(self, entity_id: str, alias: str) -> None:
+        for word in set(alias.lower().split()):
             self._index.setdefault(word, set()).add(entity_id)
 
     def drop_entity_index(self, entity_id: str) -> None:

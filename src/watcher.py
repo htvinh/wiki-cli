@@ -48,12 +48,17 @@ def watch(
             cycles += 1
 
 
+_SUPPORTED_EXTS: frozenset[str] = frozenset(
+    ".txt .md .docx .pdf .html .htm .pptx .xlsx .csv .json .xml .rtf".split()
+)
+
+
 def _scan_txt(raw_dir: str) -> list[str]:
     if not os.path.isdir(raw_dir):
         return []
     return sorted(
         os.path.join(raw_dir, f) for f in os.listdir(raw_dir)
-        if f.endswith(".txt")
+        if os.path.splitext(f)[1].lower() in _SUPPORTED_EXTS
     )
 
 
