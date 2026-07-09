@@ -61,7 +61,7 @@ def run_benchmark(num_files: int, seed: int = 42, tmp_root: str = "bench_tmp") -
         "compile_total_s": t4 - t1,
         "full_pipeline_s": t5 - t1,
         "broken_links": len(report.broken_links),
-        "lexical_unlinked": len(report.lexical_unlinked_pages),
+        "unreachable_pages": len(report.unreachable_pages),
     }
 
 
@@ -75,7 +75,7 @@ def print_result(r: dict) -> None:
     print(f"  compile total (extract+graph+rewrite): {r['compile_total_s']*1000:.2f} ms")
     print(f"  full pipeline (+lint):                 {r['full_pipeline_s']*1000:.2f} ms")
     print(f"  lint result: {r['broken_links']} broken links, "
-          f"{r['lexical_unlinked']} lexically unlinked")
+          f"{r['unreachable_pages']} unreachable")
     print()
 
 

@@ -19,8 +19,7 @@ sys.path.insert(0, THIS_DIR)
 from compiler import compile_wiki
 from extractor import Entity, extract_all, extract_entity
 from generator import generate_corpus
-from graph import (build_graph, build_navigation_edges, graph_report,
-                   orphan_ids)
+from graph import build_graph, build_navigation_edges, graph_report, orphan_ids
 from linter import lint
 from rewriter import compile_pages, render_page
 
@@ -306,7 +305,7 @@ class TestRewriter(unittest.TestCase):
         page_a = render_page(entities["alpha"], g["alpha"], entities)
         page_b = render_page(entities["beta"], g["beta"], entities)
         self.assertIn("[Beta](beta.md)", page_a.split("## Related")[1].split("## Referenced By")[0])
-        self.assertIn("[Alpha](alpha.md)", page_b.split("## Referenced By")[1])
+        self.assertIn("[Alpha](alpha.md)", page_b.split("## Linked From")[1])
 
     def test_human_notes_preserved_across_recompile(self):
         entities = {
@@ -343,10 +342,9 @@ class TestLinter(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_linter_does_not_miscount_referenced_by(self):
-        # Regression test: Referenced By sections contain [[links]] too.
-        # A naive linter that scans the whole file for incoming-link
-        # counting will falsely mark real orphans as non-orphaned.
+    def test_linter_no_unreachable_when_index_references_all(self):
+        # The auto-generated index.md links to every page,
+        # so no pages are unreachable without store.
         entities = {
             "alpha": Entity(entity_id="alpha", name="Alpha", body="mentions Beta"),
             "beta": Entity(entity_id="beta", name="Beta", body="mentions nothing"),
@@ -354,9 +352,17 @@ class TestLinter(unittest.TestCase):
         g = build_graph(entities)
         compile_pages(entities, g, self.tmp)
         report = lint(self.tmp)
-        # Alpha has no incoming links (nothing links to it) -> orphan.
-        self.assertIn("alpha.md", report.lexical_unlinked_pages)
-        self.assertNotIn("beta.md", report.lexical_unlinked_pages)
+        self.assertEqual(len(report.unreachable_pages), 0)
+
+    def test_linter_unreachable_without_index(self):
+        # A page that's not in any index is unreachable.
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        # Write only a content page, no index
+        with open(os.path.join(out, "lonely.md"), "w") as f:
+            f.write("# Lonely\n\n## Body\n\nNobody links to me.")
+        report = lint(out)
+        self.assertIn("lonely.md", report.unreachable_pages)
 
     def test_broken_link_detected(self):
         entities = {
@@ -395,7 +401,7 @@ class TestFullPipeline(unittest.TestCase):
         generate_corpus(raw_dir, num_files=30, seed=42)
         result = compile_wiki(raw_dir, out_dir)
         self.assertEqual(len(result["entities"]), 30)
-        self.assertEqual(len(result["written_paths"]), 30)
+        self.assertEqual(len(result["written_paths"]), 31)  # 30 content + 1 index
         self.assertEqual(result["lint_report"].broken_links, [])
         self.assertEqual(result["lint_report"].total_pages, 31)
 
@@ -763,7 +769,7 @@ class TestCompiler(unittest.TestCase):
         generate_corpus(raw_dir, num_files=10, seed=42)
         compiler = Compiler(CompilerConfig(lint=True))
         result = compiler.compile(raw_dir, out_dir)
-        self.assertEqual(result.pages_written, 10)
+        self.assertEqual(result.pages_written, 11)  # 10 content + 1 index
         self.assertIsNotNone(result.lint_report)
         self.assertEqual(result.stats.entity_count, 10)
         self.assertGreater(result.stats.elapsed_s, 0)
@@ -814,7 +820,7 @@ class TestCompiler(unittest.TestCase):
         generate_corpus(raw_dir, num_files=10, seed=42)
         result = compile_wiki(raw_dir, out_dir)
         self.assertEqual(len(result["entities"]), 10)
-        self.assertEqual(len(result["written_paths"]), 10)
+        self.assertEqual(len(result["written_paths"]), 11)  # 10 content + 1 index
         self.assertIsNotNone(result["lint_report"])
         self.assertIn("graph", result)
 
@@ -833,8 +839,8 @@ class TestCompiler(unittest.TestCase):
         self.assertEqual(len(old["written_paths"]), new.pages_written)
         self.assertEqual(len(old["lint_report"].broken_links),
                          len(new.lint_report.broken_links))
-        self.assertEqual(len(old["lint_report"].lexical_unlinked_pages),
-                         len(new.lint_report.lexical_unlinked_pages))
+        self.assertEqual(len(old["lint_report"].unreachable_pages),
+                         len(new.lint_report.unreachable_pages))
 
     def test_compiler_with_di(self):
         from compiler import CompilePlanner, Compiler, CompilerConfig
@@ -1072,7 +1078,7 @@ class TestCompilePlannerWithStore(unittest.TestCase):
         store = MemoryStore()
         compiler = Compiler(config=CompilerConfig(lint=False), store=store)
         result = compiler.compile(raw, out)
-        self.assertEqual(result.pages_written, 3)
+        self.assertEqual(result.pages_written, 4)  # 3 content + 1 index
 
     def test_compiler_with_no_store_backward_compat(self):
         from compiler import Compiler, CompilerConfig
@@ -1367,7 +1373,7 @@ class TestParallelExtraction(unittest.TestCase):
         out = os.path.join(self.tmp, "out")
         compiler = Compiler(config=CompilerConfig(workers=1))
         result = compiler.compile(raw, out)
-        self.assertEqual(result.pages_written, 5)
+        self.assertEqual(result.pages_written, 6)
 
     def test_compiler_workers2_produces_same_output(self):
         from compiler import Compiler, CompilerConfig

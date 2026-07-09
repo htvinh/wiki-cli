@@ -5,8 +5,8 @@
 wiki-cli is a pure-Python tool (stdlib + MarkItDown) that compiles a directory
 of raw notes — `.txt`, `.md`, `.docx`, `.pdf`, `.html`, `.pptx`, `.xlsx`,
 `.csv`, `.json`, `.xml`, `.rtf` — into a linked, linted markdown wiki. It
-performs six sequential stages — conversion, extraction, graph construction,
-rewriting, linting, and (optionally) persistent caching — all deterministically,
+performs four sequential stages — extraction, graph construction (three-graph:
+navigation, link, folder), rewriting, and linting — all deterministically,
 without any LLM calls, embeddings, or external services.
 
 Designed to scale from hundreds to millions of documents via incremental
@@ -28,8 +28,8 @@ compilation, content hashing, streaming, and parallel extraction.
 - **Incremental by default**: unchanged files are detected via mtime/size
   and content hashing; only changed pages are re-extracted, re-graphed,
   and re-rendered.
-- **Self-validating**: the lint stage catches broken links and orphan pages
-  before they accumulate.
+- **Self-validating**: the lint stage catches broken links, duplicate titles,
+  and unreachable pages before they accumulate.
 - **i18n**: English, Vietnamese, and mixed content fully supported. The
   tokeniser uses Unicode word boundaries (`\w`), not ASCII-only patterns.
 - **Multi-format input**: MarkItDown converts `.docx`, `.pdf`, `.html`,
@@ -47,29 +47,27 @@ compilation, content hashing, streaming, and parallel extraction.
 ```
                     Compiler (thin orchestrator)
                         │
-                  CompilePlanner
+                   CompilePlanner
                         │
-                ChangeDetector
+                 ChangeDetector
                         │
-               SourceProvider
+                SourceProvider
                         │
                      Store (facade)
                         │
   ┌──────────┬────────────┬──────────┬────────────┐
   │          │            │          │            │
   Entity   GraphRepo  IndexRepo  StateRepo  ContentRepo
-  │          │            │          │            │
   └──────────┴────────────┴──────────┴────────────┘
                         │
-  ┌──────────┬────────────┬──────────┬────────────┬──────────┐
-  │          │            │          │            │          │
-  Extractor GraphBuilder Renderer LinkResolver Validator
+  ┌──────────┬────────────┬──────────┬────────────┐
   │          │            │          │            │
-  └──────────┴────────────┴──────────┴────────────┴──────────┘
+  Extractor GraphBuilder Renderer   LinkResolver  Validator
+  └──────────┴────────────┴──────────┴────────────┘
                         │
-                  CompileStats
+                   CompileStats
                         │
-                  Event Stream
+                   Event Stream
 ```
 
 Each component has a single responsibility. The `Compiler` is a thin
@@ -89,18 +87,18 @@ Converter (MarkItDown) ──► markdown text
      │
      ▼
 ChangeDetector: stat → mtime/size match? → skip
-     │                     │
-     │     version cols stale? → re-extract
-     │                     │
-     │      hash → source_hash match? → skip
-     │                     │
-     ▼                     ▼
+     │                    │
+     │    version cols stale? → re-extract
+     │                    │
+     │    hash → source_hash match? → skip
+     │                    │
+     ▼                    ▼
 Extractor ──► EntityRepo ──► GraphBuilder ──► Renderer ──► Validator
      │           │               │               │              │
-     │      body cache       word_index     .md files    LintReport
-     │      (filesystem)     persistent       │
-     │      aliases          edges            │
-     └─────────────────────────────────────────┘
+     │      body cache     3-graph       .md + .html    LintReport
+     │      (filesystem)    builder         files
+     │      aliases         (nav/link/
+     └────────────────────  folder)─────────────────────────────┘
                                         Watch Mode
                                      (polling loop)
 ```
@@ -126,12 +124,13 @@ wiki-cli/
     ├── init.py             # zero-config demo entrypoint
     ├── linter.py           # Stage 4: broken-link + orphan validation
     ├── plugin.py           # Plugin, Extractor, Renderer, Validator, LinkResolver ABCs
-    ├── rewriter.py         # Stage 3: section-aware markdown output
+    ├── relationship.py     # Three-graph engine (nav, link, folder)
+    ├── rewriter.py         # Stage 3: section-aware markdown + HTML output
     ├── source.py           # SourceProvider ABC + FilesystemProvider + ConvertingDocument
     ├── store.py            # Store ABC, SQLiteStore, MemoryStore, repos, migrations
     ├── watcher.py          # polling-based file watcher
     ├── benchmark.py        # timing harness
-    └── tests.py            # 125 unittest tests
+    └── tests.py            # 136 unittest tests
 ```
 
 ### 2.4 Import convention
@@ -221,16 +220,12 @@ CREATE TABLE entities (
 CREATE TABLE graph_edges (
     source TEXT NOT NULL,
     target TEXT NOT NULL,
-    PRIMARY KEY (source, target)
+    graph_name TEXT NOT NULL DEFAULT 'lexical',
+    edge_type TEXT DEFAULT '',
+    PRIMARY KEY (source, target, graph_name)
 );
 
 CREATE INDEX idx_graph_target ON graph_edges(target);
-
-CREATE TABLE aliases (
-    entity_id TEXT NOT NULL,
-    alias     TEXT NOT NULL,
-    PRIMARY KEY (entity_id, alias)
-);
 
 CREATE TABLE word_index (
     word               TEXT NOT NULL,
@@ -257,19 +252,16 @@ forces a full rebuild with identical output.
 | `entity_count` | Quick stats without counting rows |
 | `edge_count` | Quick stats without counting rows |
 
-### 3.5 Graph structure
+### 3.5 Graph structure (three-graph)
 
-Edges are stored in `graph_edges` table. For in-memory processing, the
-graph is materialised as:
+Edges are stored in `graph_edges` with a `graph_name` column distinguishing
+three graphs: `navigation` (folder hierarchy), `lexical` (`[[Page]]` mentions),
+and `folder` (parent/child/sibling). Each graph is independently queryable:
 
 ```python
-{
-    entity_id: {
-        "outgoing": {target_id, ...},
-        "incoming": {source_id, ...},
-    },
-    ...
-}
+store.graph.get_outgoing(entity_id, "lexical")      # [[Page]] mentions
+store.graph.get_outgoing(entity_id, "navigation")    # parent/child
+store.graph.get_outgoing(entity_id, "folder")        # folder siblings
 ```
 
 ### 3.6 LintReport
@@ -277,10 +269,26 @@ graph is materialised as:
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_pages` | `int` | Number of `.md` files in output |
+| `content_pages` | `int` | Content pages (not index/README/Home) |
+| `index_pages` | `int` | Generated index pages |
 | `broken_links` | `list[tuple[str, str]]` | `(source_file, broken_target_name)` |
-| `orphan_pages` | `list[str]` | Filenames with zero incoming links |
+| `duplicate_titles` | `list[tuple[str, list[str]]]` | `(title, [filenames])` for content pages only |
+| `unreachable_pages` | `list[str]` | Pages with no parent, no child, no backlinks, no index reference |
+| `missing_metadata` | `list[tuple[str, str]]` | `(filename, field)` — only shown in `--strict` mode |
 
-### 3.7 CompileResult + CompileStats
+### 3.7 Lint checks
+
+1. **Broken links**: every `[name](slug.md)` is resolved to a known slug.
+   Unknown slugs are reported.
+2. **Duplicate titles**: content pages only. Index pages (`index.md`,
+   `home.md`, `readme.md`, "Wiki Index") are exempt.
+3. **Unreachable pages**: a page is unreachable if it has no parent
+   (navigation), no child (navigation), no backlink (`[[Page]]` from
+   another page), and is not referenced by any index page.
+4. **Missing metadata** (optional, `--strict` only): `created` and
+   `aliases` fields.
+
+### 3.8 CompileResult + CompileStats
 
 ```python
 @dataclass
@@ -288,6 +296,7 @@ class CompileResult:
     pages_written: int
     lint_report: LintReport | None
     stats: CompileStats
+    graph_report: GraphReport | None = None
 
 @dataclass
 class CompileStats:
@@ -302,7 +311,7 @@ class CompileStats:
     cache_misses: int
     cache_hit_ratio: float
     broken_links: int
-    orphans: int
+    lexical_unlinked: int
     elapsed_s: float
     entities_per_sec: float
     pages_per_sec: float
@@ -337,17 +346,16 @@ class EntityRepo(ABC):
     def exists(self, entity_id: str) -> bool: ...
     def delete(self, entity_id: str) -> None: ...
 
-Note: all collection-returning methods use iterators/streams rather than
-materialising full dicts, to avoid memory explosion at scale.
-
 class GraphRepo(ABC):
-    def put_edge(self, source: str, target: str) -> None: ...
-    def delete_outgoing(self, entity_id: str) -> None: ...
-    def delete_incoming(self, entity_id: str) -> None: ...
-    def get_outgoing(self, entity_id: str) -> set[str]: ...
-    def get_incoming(self, entity_id: str) -> set[str]: ...
-    def get_all_outgoing(self) -> dict[str, set[str]]: ...
-    def get_edge_count(self) -> int: ...
+    def put_edge(self, source: str, target: str, graph_name: str = "lexical", edge_type: str = "") -> None: ...
+    def delete_outgoing(self, entity_id: str, graph_name: str | None = None) -> None: ...
+    def delete_incoming(self, entity_id: str, graph_name: str | None = None) -> None: ...
+    def get_outgoing(self, entity_id: str, graph_name: str | None = None) -> set[str]: ...
+    def get_incoming(self, entity_id: str, graph_name: str | None = None) -> set[str]: ...
+    def get_edge_type(self, source: str, target: str, graph_name: str) -> str | None: ...
+    def get_all_outgoing(self, graph_name: str | None = None) -> dict[str, set[str]]: ...
+    def get_edge_count(self, graph_name: str | None = None) -> int: ...
+    def get_graph_names(self) -> set[str]: ...
 
 class IndexRepo(ABC):
     def index_name(self, entity_id: str, name: str) -> None: ...
@@ -383,15 +391,17 @@ class Store(ABC):
     def vacuum(self) -> None: ...
 ```
 
-### 4.2 Transaction context manager
+### 4.2 Graph names
 
-Transactions are exposed via a context manager, not as raw `BEGIN`/`COMMIT`:
+Three named graphs in `graph_edges`:
 
-```python
-class Store(ABC):
-    @contextmanager
-    def transaction(self) -> Generator[None, None, None]: ...
-```
+| `graph_name` | Contents |
+|-------------|----------|
+| `navigation` | Folder hierarchy: parent → child edges from `RelationshipEngine.build_all()` |
+| `lexical` | `[[Page]]` mention links from `WordIndexGraphBuilder` |
+| `folder` | Parent/child/sibling edges used for `compute_related()` scoring |
+
+### 4.3 Transaction context manager
 
 Each stage group is wrapped:
 
@@ -400,38 +410,30 @@ with store.transaction():
     # ChangeDetector: update mtime/size/hashes
 
 with store.transaction():
-    # Extract: write entities + aliases
+    # Extract: write entities
 
 with store.transaction():
     # Graph: clear edges → scan → insert edges → update word_index
 
 with store.transaction():
-    # state.set("last_successful_stage", "render")
+    # relationship: build navigation edges
 ```
 
-The context manager commits on success, rolls back on exception. If a stage
-crashes, the cache is consistent up to the last committed transaction. The
-next run picks up from the last successful stage.
+### 4.4 Schema migration
 
-### 4.3 Schema migration
-
-A `Migration` interface handles version upgrades without dropping data:
+A `Migration` interface handles version upgrades without dropping data.
 
 ```python
 class Migration(ABC):
     @property
     def version(self) -> int: ...
     def migrate(self, conn: sqlite3.Connection) -> None: ...
-
-MIGRATIONS = [Migration1(), Migration2(), ...]
 ```
 
 On open, `SQLiteStore` reads `compile_state.schema_version`, applies any
 pending migrations in order, and writes the new version.
 
-### 4.4 SQLiteStore pragmas
-
-Performance-critical settings applied on every connection:
+### 4.5 SQLiteStore pragmas
 
 | Pragma | Value | Effect |
 |--------|-------|--------|
@@ -451,37 +453,7 @@ Converts non-plaintext documents (`.docx`, `.pdf`, `.html`, `.pptx`, `.xlsx`,
 wiki pipeline like native `.txt` files. Implemented in `src/converter.py`
 using MarkItDown.
 
-### 5.2 API
-
-```python
-from converter import is_supported, needs_conversion, convert_to_text
-
-# Check if a file extension is supported
-is_supported("report.docx")  # True
-is_supported("notes.xyz")    # False
-
-# Check if conversion is needed (vs direct read)
-needs_conversion("notes.txt")    # False (read directly)
-needs_conversion("report.docx")  # True (convert via MarkItDown)
-
-# Convert a document to markdown text
-text = convert_to_text("report.docx")  # str
-```
-
-### 5.3 Integration
-
-`FilesystemProvider.iter_documents()` returns `FilesystemDocument` for
-`.txt`/`.md` files and `ConvertingDocument` for other formats.
-`ConvertingDocument.read_bytes()` lazily calls `convert_to_text()` and
-returns the UTF-8-encoded markdown. The extractor receives the converted
-text via the `content` parameter:
-
-```python
-content = doc.read_bytes().decode("utf-8")
-entity = extract_entity(doc.path, content=content)
-```
-
-### 5.4 Supported formats
+### 5.2 Supported formats
 
 | Extension | Format | Notes |
 |-----------|--------|-------|
@@ -503,25 +475,13 @@ entity = extract_entity(doc.path, content=content)
 
 ### 6.1 Purpose
 
-Accepts document content (either read from a `.txt`/`.md` file or
-pre-converted by MarkItDown) and extracts structured `Entity` objects.
-The `FilesystemProvider` yields documents for `.txt`, `.md`, and any
-MarkItDown-convertible format (`.docx`, `.pdf`, `.html`, etc.). Extraction
-accepts an optional `content` parameter for pre-read text:
-
-```python
-def extract_entity(path: str, content: str | None = None) -> Entity: ...
-```
+Accepts document content and extracts structured `Entity` objects.
 
 ### 6.2 Header detection
 
-Two formats, checked in order:
-
 1. **Hash header**: first non-empty line matching `^# (.+)$`.
 2. **Bare uppercase header**: first non-empty line with zero lowercase letters
-   (`line.isupper()`) at index 0 → converted via `.title()`. This heuristic
-   is English-specific; Vietnamese and mixed-content files typically use the
-   `#` format.
+   (`line.isupper()`) at index 0 → converted via `.title()`.
 
 If neither matches, the name is derived from the filename:
 `base.replace("_", " ").title()`.
@@ -536,76 +496,44 @@ After the header, each line is checked against:
 Both are optional. Matching lines are consumed; all others accumulate into
 the body.
 
-### 6.4 Change detection integration
-
-Before extraction, `ChangeDetector` checks:
-1. `mtime` + `size` from `os.stat()` against stored values → skip if match.
-2. SHA-256 source hash against stored `source_hash` → skip extraction if
-   match, reuse cached entity.
-3. SHA-256 body hash against stored `body_hash` → skip recompile if match.
-4. SHA-256 metadata hash against stored `metadata_hash` → skip graph update
-   if match.
-
-This means five `stat()` calls on steady state (no changes) and zero hashing
-on steady state.
-
-### 6.5 Edge cases
+### 6.4 Edge cases
 
 - Empty file → filename-derived title, empty body.
 - File with only metadata → body is empty.
-- Unknown metadata patterns → treated as body text.
 - Vietnamese headers (`# Hệ Thống`) → extracted correctly via Unicode regex.
-- Mixed English-Vietnamese body → extracted verbatim.
 
 ---
 
 ## 7. Stage 2: Graph
 
-### 7.1 Purpose
-
-Detects mentions of one entity's name inside another entity's body text and
-builds a bidirectional reference map.
-
-### 7.2 Word-indexed phrase matcher
+### 7.1 Word-indexed phrase matcher
 
 Uses a word-indexed strategy to avoid O(n²):
 
 1. **Index construction**: entity names are split into lowercase word-tuples.
    An index maps each first-word → `(word_tuple, entity_id)`, sorted
    longest-first for multi-word name priority.
-
 2. **Scanning**: each body is tokenized once using `[\w']+` (Unicode-aware,
    supports Vietnamese). At each token position, the index is consulted for
    candidates; the longest matching tuple wins.
 
-### 7.3 Key rules
+### 7.2 Key rules
 
 - **No self-links**: mention of own name is ignored.
 - **Case-insensitive**.
-- **Whole-word**: `[\w']+` tokenisation; punctuation-spliced mentions are not
-  matched.
-- **Longest match wins**: "Attention Mechanism" beats "Attention" at the same
-  position.
+- **Whole-word**: `[\w']+` tokenisation.
+- **Longest match wins**: "Attention Mechanism" beats "Attention".
 
-### 7.4 Incremental update
+### 7.3 Incremental update
 
-Driven by the `ChangeSet` (added, modified, deleted, renamed):
+Driven by the `ChangeSet` (added, modified, deleted):
 
 1. Remove all edges and index entries for deleted entities.
 2. Delete outgoing edges for added/modified entities, then re-scan bodies.
 3. For each added/modified entity's name words, query `word_index` for
    candidate pages → re-scan only those candidates.
-4. Re-scan entities that previously linked to deleted entities (their
-   `## Related` section must update).
 
 At steady state: zero work for the graph stage.
-
-### 7.5 i18n
-
-Tokenisation uses `[\w']+`, where `\w` in Python 3 matches Unicode letters
-including Vietnamese characters (`đ`, `ệ`, `ô`, `à`, `ả`, `ã`, etc.).
-Vietnamese entity names like `Hệ Thống` are correctly tokenised and matched
-in both Vietnamese and mixed-language bodies.
 
 ---
 
@@ -622,10 +550,10 @@ in both Vietnamese and mixed-language bodies.
 - source: raw_notes/<slug>.txt
 
 ## Related
-- [[Other Entity]]
+- [Other Entity](other_entity.md)
 
-## Referenced By
-- [[Source Entity]]
+## Linked From
+- [Source Entity](source_entity.md)
 
 ## Body
 (raw extracted body text)
@@ -639,55 +567,49 @@ _(add your own notes here -- preserved on recompile)_
 | Section | Ownership | Behaviour |
 |---------|-----------|-----------|
 | `## Metadata` | Compiler | Regenerated every compile |
-| `## Related` | Compiler | Regenerated from graph edges |
-| `## Referenced By` | Compiler | Regenerated from graph edges |
+| `## Related` | Compiler | Top-5 scored from navigation + lexical + folder graphs |
+| `## Linked From` | Compiler | All pages that link to this page |
 | `## Body` | Compiler | Regenerated from extracted body |
 | `## Notes` | Human | Preserved verbatim across recompiles |
 
-### 8.3 Notes preservation
+### 8.3 Related page scoring
+
+The `RelationshipEngine.compute_related()` produces a ranked list:
+
+| Signal | Score |
+|--------|-------|
+| Same-folder sibling | +5 |
+| Parent page | +3 |
+| Lexical outgoing mention (`[[Page]]`) | +3 |
+| Backlink (page that links to this) | +2 |
+| Shared body words (every 5 tokens) | +2 |
+| Shared name words | +1 |
+
+Top 5 are written to `## Related`.
+
+### 8.4 Index page generation
+
+For each directory in the output, an `index.md` and `index.html` are generated
+automatically, listing all `.md` files and subdirectories.
+
+### 8.5 Notes preservation
 
 Before writing, `render_page()` checks the output path. If a previous
 `.md` file exists, it reads the old file, parses sections via `^## (.+)$`,
 and preserves the `## Notes` section content. If no existing file, a
 placeholder is written.
 
-### 8.4 Incremental skip
-
-If `body_hash` is unchanged and the entity is not in the changed set, the
-page is skipped entirely (no I/O). The `## Notes` preservation still runs
-(Notes can change independently of the source body), but the file is only
-read, not written.
-
 ---
 
-## 9. Stage 4: Linter (Validator)
-
-### 8.1 Checks
-
-1. **Broken links**: every `[[Link Name]]` in every output file is resolved
-   via slug → known slugs. Unknown slugs are reported.
-2. **Orphan pages**: pages with zero incoming links. Incoming links are
-   counted from the `## Related` section only (not `## Referenced By`, which
-   would double-count and produce false negatives).
-
-### 8.2 LintReport
-
-Returned by `lint()`. Formatted for human output via `print_report()`.
-
----
-
-## 10. ChangeDetector
+## 9. ChangeDetector
 
 ### 9.1 ChangeSet
-
-Instead of a plain `set[str]` of changed IDs, ChangeDetector returns a typed
-dataclass that captures every file lifecycle event:
 
 ```python
 @dataclass
 class ChangeSet:
     added: set[str]       # new files not in previous compile
-    modified: set[str]    # existing files with changed content
+    modified: set[str]       # existing files with changed content
     deleted: set[str]     # files removed from source
     renamed: dict[str, str]  # old_id → new_id (hash-based)
     unchanged: set[str]   # files with no changes (fast skip)
@@ -695,35 +617,26 @@ class ChangeSet:
 
 ### 9.2 Algorithm
 
-Before any hash check, version columns are verified. If any version column
-is stale, the entity is re-extracted regardless of mtime/hash:
-
 ```
-for each .txt file:
+for each file:
     stat() → (mtime, size)
-    stored = store.entities.get(entity_id)
 
-    if version columns stale (compiler, extractor, or tokenizer):
-        force re-extract (cache is stale)
-
+    if version columns stale (compiler, extractor, tokenizer):
+        force re-extract
     elif stored and mtime == stored.mtime and size == stored.size:
-        mark unchanged (no hash, no I/O)
-
+        mark unchanged
     else:
         hash = sha256(file_content)
         if hash == stored.source_hash:
-            update stored mtime/size only (body unchanged)
-
+            update stored mtime/size only
         else:
             extract entity
             if entity.body_hash == stored.body_hash:
-                update source_hash + mtime/size + versions (page unchanged)
-            elif entity.metadata_hash == stored.metadata_hash:
-                mark graph for update, skip recompile
+                update source_hash + mtime/size + versions
             else:
-                mark full update needed
+                mark full update
 
-for each known entity_id not seen in this pass:
+for each stored entity not seen:
     mark deleted
 ```
 
@@ -740,26 +653,11 @@ When a source file is removed:
 7. `os.remove(output_file)` → removes rendered `.md`.
 8. All dependent pages are re-rendered (their `## Related` section changes).
 
-### 9.4 Rename detection
-
-The `ChangeSet.renamed` map is populated via content hash comparison — if a
-deleted file's hash matches an added file's hash, it's a rename rather than
-a delete+add. This preserves incoming links across renames. Implementation is
-deferred to a later phase; initial behaviour treats renames as delete+add.
-
-### 9.5 Purpose
-
-Determines which source files have changed since the last compile, using a
-three-tier fast-skip strategy.
-
 ---
 
-## 11. API Reference
+## 10. API Reference
 
 ### 10.1 Compiler class
-
-The compiler accepts optional dependency injection — if no explicit
-dependencies are provided, they are constructed from `CompilerConfig`:
 
 ```python
 class Compiler:
@@ -770,16 +668,13 @@ class Compiler:
         store: Store | None = None,
         source_provider: SourceProvider | None = None,
         graph_builder: GraphBuilder | None = None,
-        link_resolver: LinkResolver | None = None,
     ): ...
 
-    def compile(self, raw_dir: str, output_dir: str) -> CompileResult:
-        """Blocking compile."""
+    def compile(self, raw_dir: str, output_dir: str) -> CompileResult: ...
 
     def compile_events(
         self, raw_dir: str, output_dir: str
-    ) -> Generator[CompileEvent, None, CompileResult]:
-        """Yields typed progress events, returns CompileResult."""
+    ) -> Generator[CompileEvent, None, CompileResult]: ...
 ```
 
 ### 10.2 CompilerConfig
@@ -792,30 +687,18 @@ class CompilerConfig:
     lint: bool = True
     incremental: bool = True
     parallel: bool = False
-    watch: bool = False
-    extractors: list[Extractor] | None = None
-    renderers: list[Renderer] | None = None
-    validators: list[Validator] | None = None
+    strict: bool = False
+    navigation_hubs: int = 0
+    source_provider: SourceProvider | None = None
+    extractors: list | None = None
+    renderers: list | None = None
+    validators: list | None = None
+    link_resolver: object | None = None
 ```
 
-### 10.3 Progress events (CompileEvent)
+### 10.3 Plugin interfaces
 
-```python
-@dataclass
-class CompileEvent:
-    event: str         # phase_start, extracted, skipped, written, ...
-    phase: str         # extract, graph, render, lint
-    timestamp: float   # time.perf_counter()
-    entity_id: str | None = None
-    elapsed: float | None = None
-    payload: dict | None = None
-```
-
-Standardised typed events instead of raw dicts. IDE-friendly, extensible.
-
-### 10.4 Plugin interfaces
-
-All plugins inherit from `PluginBase` for lifecycle management:
+All plugins inherit from `Plugin` for lifecycle management:
 
 ```python
 class Plugin(ABC):
@@ -832,72 +715,20 @@ class Renderer(Plugin):
 class Validator(Plugin):
     def validate(self, output_dir: str, store: Store) -> LintReport: ...
 
-class StoreBackend(Plugin):
-    def open(self, path: str) -> Store: ...
-    def exists(self, path: str) -> bool: ...
-    def delete(self, path: str) -> None: ...
-
-@dataclass
-class GraphBuilderResult:
-    edge_count: int
-    changed_edges: int
-    orphans: int
-    elapsed_s: float
-
 class GraphBuilder(Plugin):
-    def build(self, changes: ChangeSet, store: Store) -> GraphBuilderResult: ...
+    def build(self, changes: ChangeSet, store: Store, entities: dict[str, Entity]) -> GraphBuilderResult: ...
 
 class LinkResolver(Plugin):
     def resolve(self, link_name: str, known_slugs: set[str]) -> str | None: ...
     def slugify(self, name: str) -> str: ...
 ```
 
-`Compiler` calls `initialize()` on all plugins before the pipeline starts
-and `shutdown()` after completion.
-
 Default implementations: `TxtExtractor`, `MarkdownRenderer`, `WikiLinter`,
 `WordIndexGraphBuilder`, `WikiLinkResolver`.
 
-### 10.5 SourceProvider
-
-Abstracts input sources so the compiler works with filesystem, archive,
-Git repos, or remote sources without changes:
-
-```python
-class Document(ABC):
-    @property
-    def id(self) -> str: ...          # stable identifier (path, blob hash, etc.)
-    @property
-    def path(self) -> str: ...        # human-readable label
-    @property
-    def mtime(self) -> float: ...
-    @property
-    def size(self) -> int: ...
-    def read_bytes(self) -> bytes: ...
-
-class SourceProvider(ABC):
-    def iter_documents(self, raw_dir: str) -> Generator[Document, None, None]: ...
-
-class FilesystemProvider(SourceProvider):
-    def iter_documents(self, raw_dir: str) -> Generator[Document, None, None]: ...
-```
-
-### 10.6 Plugin registration
-
-```python
-CompilerConfig(
-    extractors=[TxtExtractor()],
-    renderers=[MarkdownRenderer()],
-    graph_builder=WordIndexGraphBuilder(),
-    link_resolver=WikiLinkResolver(),
-    store_backend=SQLiteStoreBackend(),
-    source_provider=FilesystemProvider(),
-)
-```
-
 ---
 
-## 12. CLI Reference
+## 11. CLI Reference
 
 ### 11.1 Main compiler
 
@@ -908,18 +739,35 @@ wiki-cli raw_dir output_dir [options]
 
 Options:
   --no-lint             Skip the lint pass
-  --watch, -w           Watch for file changes and recompile automatically
-  --poll-interval SEC   Polling interval in seconds (default: 1.0)
+  --strict              Report optional metadata warnings (missing created/aliases)
   --workers N           Parallel extraction workers (default: 1)
+  --report              Print graph report after compilation
 ```
 
-### 11.2 Benchmark
+### 11.2 Output example
+
+```
+....................
+Compiled 20 content + 1 generated index page → 21 pages in 0.01s
+Output: /tmp/wiki_ux
+
+Lint Summary
+----------------------------
+Pages checked:         21
+Broken links:           0
+Duplicate titles:       0
+Unreachable pages:      0
+
+✓ All checks passed.
+```
+
+### 11.3 Benchmark
 
 ```
 python src/benchmark.py [--files N ...] [--seed N] [--workers N]
 ```
 
-### 11.3 Init
+### 11.4 Init
 
 ```
 python src/init.py
@@ -927,48 +775,42 @@ python src/init.py
 
 ---
 
-## 13. Exception Hierarchy
+## 12. Exception Hierarchy
 
 ```
 WikiCompilerError (Exception)
 ├── ExtractionError
 ├── RewriteError
 ├── LintError
-└── StoreError        (persistence failures)
+└── StoreError
 ```
 
 ---
 
-## 14. Testing
+## 13. Testing
 
-### 13.1 Test framework
-
-Stdlib `unittest`. **125 tests** across 16 test classes covering every
+**136 tests** across 16 test classes covering every
 stage, plugin, and integration point.
 
 | Test class | Tests | Covers |
 |------------|-------|--------|
 | `TestGenerator` | 2 | Determinism, file count |
-| `TestExtractor` | 8 | Hash/uppercase/filename header, aliases, `.md` acceptance, Vietnamese header, Vietnamese slug, mixed body, content param |
-| `TestGraph` | 6 | Edge creation, self-link, orphan, Vietnamese mention, mixed mention, Vietnamese self-link |
+| `TestExtractor` | 8 | Hash/uppercase/filename header, aliases, `.md` acceptance, Vietnamese |
+| `TestGraph` | 6 | Edge creation, self-link, orphan, Vietnamese mention |
 | `TestRewriter` | 3 | Sections, notes preservation |
-| `TestLinter` | 3 | Referenced-by regression, broken link, clean wiki |
-| `TestFullPipeline` | 1 | End-to-end pipeline |
-| `TestStore` | 17 | Entity round-trip, edge storage, word index, hash storage, `get_all_outgoing`, version columns |
+| `TestLinter` | 3 | Unreachable detection, broken link, clean wiki |
+| `TestFullPipeline` | 2 | End-to-end idempotency |
+| `TestStore` | 17 | Entity round-trip, edge storage, version columns |
 | `TestStoreMigrations` | 3 | Migration framework |
-| `TestCompiler` | 14 | Config, event stream, compile modes, DI, parallel output parity |
-| `TestChangeDetector` | 7 | Version staleness, mtime/size fast skip, hash detection, deleted-file lifecycle |
+| `TestCompiler` | 14 | Config, event stream, compile modes, DI |
+| `TestChangeDetector` | 7 | Version staleness, mtime/size, hash, deleted |
 | `TestCompilePlannerWithStore` | 6 | Planner + store integration |
-| `TestGraphBuilder` | 4 | Incremental graph build, `WordIndexGraphBuilder` |
-| `TestParallelExtraction` | 6 | Deterministic parallel output, worker count |
-| `TestPlugin` | 8 | Plugin lifecycle, custom ABCs, default implementations |
-| `TestWatcher` | 9 | File scan, change detection, initial compile, recompile on change |
-| `TestSourceProvider` | 3 | Filesystem multi-format provider, document properties |
-| `TestConverter` | 12 | Extension support checks, MarkItDown conversion |
-| `TestExtractorWithContent` | 3 | Content-param extraction, file-fallback, filename-derived title |
-| `TestSourceProviderMultiFormat` | 4 | Text, md, convertible, mixed formats |
-
-### 13.2 Running
+| `TestGraphBuilder` | 4 | Incremental graph build with store |
+| `TestParallelExtraction` | 6 | Deterministic parallel output |
+| `TestPlugin` | 8 | Plugin lifecycle, ABCs, defaults |
+| `TestWatcher` | 9 | File scan, initial compile, recompile |
+| `TestSourceProvider` | 3 | Multi-format provider, doc properties |
+| `TestConverter` | 12 | Extension support, MarkItDown conversion |
 
 ```bash
 python -m unittest src.tests -v
@@ -976,7 +818,7 @@ python -m unittest src.tests -v
 
 ---
 
-## 15. CI Pipeline
+## 14. CI Pipeline
 
 `.github/workflows/ci.yml` on push/PR to `main`:
 
@@ -988,62 +830,14 @@ Dev deps: `ruff`, `mypy` (via `pip install "wiki-cli[dev]"`).
 
 ---
 
-## 16. Performance Characteristics
-
-Measured numbers stop at 10,000 files. Beyond that, figures are projected
-targets — not claims — to guide architectural decisions.
-
-| Files | Cold full pipeline | Incremental (no changes) | Incremental (1 file edited) |
-|-------|-------------------|-------------------------|-----------------------------|
-| 100 | ~15 ms | ~2 ms | ~2 ms |
-| 1,000 | ~1.8 s | ~10 ms | ~15 ms |
-| 5,000 | ~12 s | ~50 ms | ~50 ms |
-| 10,000 | ~30 s (target) | ~100 ms (target) | ~100 ms (target) |
-| 100,000 | ~4 min (projected) | ~1 s (projected) | ~2 s (projected) |
-| 1,000,000 | ~40 min (projected) | ~10 s (projected) | ~30 s (projected) |
-
-Projections assume SQLite WAL mode, mtime-based skip on steady state, and
-proportional cost per changed entity for incremental builds.
-
-Key observations:
-- **Steady state**: cost is `O(n)` `stat()` calls with zero hashing.
-- **Incremental (one file)**: cost is proportional to the changed file plus
-  its mention candidates, not total corpus size.
-- **Parallel extraction**: 3-5× speedup on extraction for 1000+ files
-  (using `concurrent.futures.ProcessPoolExecutor` with `executor.map()`
-  for deterministic submission order).
-- **Lint**: after Phase 1, orphan counts come from the Store instead of
-  re-reading `.md` files, eliminating the I/O bottleneck.
-
----
-
-## 17. Known Limitations
+## 15. Known Limitations
 
 1. **Lexical mention detection**: exact word matching, not semantic.
 2. **Limited header formats**: two styles (`#` and bare uppercase).
    Files with `##`, `===`, etc. fall back to filename-derived names.
-3. **Single-file metadata**: `created` and `aliases` must appear between
-   header and body. Interleaved metadata is not recognised.
-4. **No cycle detection**: circular reference chains are allowed.
-5. **Slug-based link resolution**: renaming a display name changes the slug
+3. **No cycle detection**: circular reference chains are allowed.
+4. **Slug-based link resolution**: renaming a display name changes the slug
    and breaks incoming `[[links]]`. The linter detects this; no automatic
    fixup is performed.
-6. **Rename detection**: source file renames are currently handled as
-   delete+add. Hash-based rename detection is deferred to a later phase.
-
----
-
-## 18. Edge Cases Handled
-
-- `.md` files in raw input are accepted and processed like `.txt` files.
-- Empty raw directory → empty output with zero-page lint report.
-- All I/O uses UTF-8 explicitly.
-- Multi-word entity names use longest-first matching.
-- `## Notes` survives recompilation across source changes.
-- Orphan detection only counts `## Related` (not `## Referenced By`).
-- Vietnamese + mixed content tokenised correctly via `[\w']+`.
-- UUID5 entity IDs survive display name renames (only slug changes).
-- Content hashing detects body-only, metadata-only, and combined changes.
-- SQLite WAL mode supports concurrent reads during parallel extraction.
-- Three-tier skip (mtime → source_hash → body_hash) minimises I/O on
-  steady state.
+5. **Rename detection**: source file renames are currently handled as
+   delete+add. Hash-based rename detection is deferred.

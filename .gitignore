@@ -4,8 +4,12 @@ __pycache__/
 dist/
 build/
 raw_notes/
+raw_notes-wiki/
 compiled_wiki/
 bench_tmp/
 .ruff_cache/
 .mypy_cache/
 datasets/
+datasets-wiki/
+.DS_Store
+.env

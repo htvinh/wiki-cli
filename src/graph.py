@@ -18,6 +18,9 @@ from enum import Enum
 from plugin import Plugin
 from store import Store
 
+LEXICAL = "lexical"
+NAVIGATION_GRAPH = "navigation"
+
 logger = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"[\w']+")
@@ -288,7 +291,7 @@ class WordIndexGraphBuilder(GraphBuilder):
                     i += 1
 
                 for target_id in targets:
-                    store.graph.put_edge(eid, target_id, EdgeType.EXPLICIT)
+                    store.graph.put_edge(eid, target_id, EdgeType.EXPLICIT, LEXICAL)
                     changed_edges += 1
 
                 # Phase 1c: scan for alias mentions — same body, different
@@ -313,7 +316,7 @@ class WordIndexGraphBuilder(GraphBuilder):
                     i += 1
 
                 for target_id in alias_targets:
-                    store.graph.put_edge(eid, target_id, EdgeType.ALIAS)
+                    store.graph.put_edge(eid, target_id, EdgeType.ALIAS, LEXICAL)
                     changed_edges += 1
 
             # Phase 2: re-scan entities whose name or alias shares a word
@@ -343,7 +346,7 @@ class WordIndexGraphBuilder(GraphBuilder):
                         if entity_obj is not None:
                             cbody = entity_obj.body
                     if cbody is not None and ename_lower in cbody.lower():
-                        store.graph.put_edge(cid, eid, EdgeType.EXPLICIT)
+                        store.graph.put_edge(cid, eid, EdgeType.EXPLICIT, LEXICAL)
                         changed_edges += 1
 
         # Phase 4: add navigation edges to most-linked hubs.
@@ -362,7 +365,8 @@ class WordIndexGraphBuilder(GraphBuilder):
                     if eid not in hubs:
                         for hub_id in hubs:
                             store.graph.put_edge(eid, hub_id,
-                                                 EdgeType.NAVIGATION)
+                                                 EdgeType.NAVIGATION,
+                                                 NAVIGATION_GRAPH)
                             changed_edges += 1
 
         # Phase 3: build full in-memory graph dict from store.

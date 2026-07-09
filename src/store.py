@@ -31,7 +31,7 @@ CURRENT_COMPILER_VERSION = "1.0.0"
 CURRENT_EXTRACTOR_VERSION = "1.0.0"
 CURRENT_TOKENIZER_VERSION = "1.0.0"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -72,7 +72,8 @@ class EntityRepo(ABC):
 class GraphRepo(ABC):
     @abstractmethod
     def put_edge(self, source: str, target: str,
-                 edge_type: str = "explicit") -> None: ...
+                 edge_type: str = "explicit",
+                 graph_name: str = "lexical") -> None: ...
 
     @abstractmethod
     def delete_outgoing(self, entity_id: str) -> None: ...
@@ -81,10 +82,16 @@ class GraphRepo(ABC):
     def delete_incoming(self, entity_id: str) -> None: ...
 
     @abstractmethod
-    def get_outgoing(self, entity_id: str) -> set[str]: ...
+    def get_outgoing(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]: ...
 
     @abstractmethod
-    def get_incoming(self, entity_id: str) -> set[str]: ...
+    def get_incoming(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]: ...
+
+    @abstractmethod
+    def get_edge_type(self, source: str, target: str,
+                      graph_name: str) -> str | None: ...
 
     @abstractmethod
     def iter_edges(self) -> Generator[tuple[str, str], None, None]: ...
@@ -105,6 +112,12 @@ class GraphRepo(ABC):
 
     @abstractmethod
     def iter_edges_by_type(self, edge_type: str) -> Generator[tuple[str, str], None, None]: ...
+
+    @abstractmethod
+    def iter_edges_by_graph(self, graph_name: str) -> Generator[tuple[str, str], None, None]: ...
+
+    @abstractmethod
+    def get_graph_names(self) -> set[str]: ...
 
 
 class IndexRepo(ABC):
@@ -227,13 +240,16 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 
 CREATE TABLE IF NOT EXISTS graph_edges (
-    source    TEXT NOT NULL,
-    target    TEXT NOT NULL,
-    edge_type TEXT NOT NULL DEFAULT 'explicit',
-    PRIMARY KEY (source, target, edge_type)
+    source     TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    edge_type  TEXT NOT NULL DEFAULT 'explicit',
+    graph_name TEXT NOT NULL DEFAULT 'lexical',
+    PRIMARY KEY (source, target, edge_type, graph_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_graph_target ON graph_edges(target);
+CREATE INDEX IF NOT EXISTS idx_graph_graph_name ON graph_edges(graph_name);
+CREATE INDEX IF NOT EXISTS idx_graph_target_graph ON graph_edges(target, graph_name);
 
 CREATE TABLE IF NOT EXISTS aliases (
     entity_id TEXT NOT NULL,
@@ -317,10 +333,14 @@ class SQLiteGraphRepo(GraphRepo):
         self._conn = conn
 
     def put_edge(self, source: str, target: str,
-                 edge_type: str = "explicit") -> None:
+                 edge_type: str = "explicit",
+                 graph_name: str = "lexical") -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO graph_edges (source, target, edge_type) VALUES (?, ?, ?)",
-            (source, target, edge_type),
+            (
+                "INSERT OR IGNORE INTO graph_edges "
+                "(source, target, edge_type, graph_name) VALUES (?, ?, ?, ?)"
+            ),
+            (source, target, edge_type, graph_name),
         )
 
     def delete_outgoing(self, entity_id: str) -> None:
@@ -333,16 +353,30 @@ class SQLiteGraphRepo(GraphRepo):
             "DELETE FROM graph_edges WHERE target = ?", (entity_id,)
         )
 
-    def get_outgoing(self, entity_id: str) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT target FROM graph_edges WHERE source = ?", (entity_id,)
-        ).fetchall()
+    def get_outgoing(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]:
+        if graph_name is None:
+            rows = self._conn.execute(
+                "SELECT target FROM graph_edges WHERE source = ?", (entity_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT target FROM graph_edges WHERE source = ? AND graph_name = ?",
+                (entity_id, graph_name),
+            ).fetchall()
         return {r[0] for r in rows}
 
-    def get_incoming(self, entity_id: str) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT source FROM graph_edges WHERE target = ?", (entity_id,)
-        ).fetchall()
+    def get_incoming(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]:
+        if graph_name is None:
+            rows = self._conn.execute(
+                "SELECT source FROM graph_edges WHERE target = ?", (entity_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT source FROM graph_edges WHERE target = ? AND graph_name = ?",
+                (entity_id, graph_name),
+            ).fetchall()
         return {r[0] for r in rows}
 
     def iter_edges(self) -> Generator[tuple[str, str], None, None]:
@@ -385,6 +419,29 @@ class SQLiteGraphRepo(GraphRepo):
         )
         for row in cursor:
             yield (row[0], row[1])
+
+    def iter_edges_by_graph(self, graph_name: str) -> Generator[tuple[str, str], None, None]:
+        cursor = self._conn.execute(
+            "SELECT source, target FROM graph_edges WHERE graph_name = ?",
+            (graph_name,),
+        )
+        for row in cursor:
+            yield (row[0], row[1])
+
+    def get_graph_names(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT graph_name FROM graph_edges"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_edge_type(self, source: str, target: str,
+                      graph_name: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT edge_type FROM graph_edges "
+            "WHERE source = ? AND target = ? AND graph_name = ?",
+            (source, target, graph_name),
+        ).fetchone()
+        return row[0] if row else None
 
 
 class SQLiteIndexRepo(IndexRepo):
@@ -511,7 +568,6 @@ class SQLiteStore(Store):
             self._conn.commit()
         elif int(stored) < SCHEMA_VERSION:
             for v in range(int(stored) + 1, SCHEMA_VERSION + 1):
-                logger.info("Applying schema migration v%s", v)
                 if v == 2:
                     self._conn.executescript(
                         "ALTER TABLE graph_edges ADD COLUMN "
@@ -528,6 +584,26 @@ class SQLiteStore(Store):
                         "ALTER TABLE graph_edges_v2 RENAME TO graph_edges;\n"
                         "CREATE INDEX IF NOT EXISTS idx_graph_target "
                         "ON graph_edges(target);\n"
+                    )
+                elif v == 3:
+                    self._conn.executescript(
+                        "CREATE TABLE IF NOT EXISTS graph_edges_v3 (\n"
+                        "    source     TEXT NOT NULL,\n"
+                        "    target     TEXT NOT NULL,\n"
+                        "    edge_type  TEXT NOT NULL DEFAULT 'explicit',\n"
+                        "    graph_name TEXT NOT NULL DEFAULT 'lexical',\n"
+                        "    PRIMARY KEY (source, target, edge_type, graph_name)\n"
+                        ");\n"
+                        "INSERT INTO graph_edges_v3 (source, target, edge_type, graph_name)\n"
+                        "SELECT source, target, edge_type, 'lexical' FROM graph_edges;\n"
+                        "DROP TABLE graph_edges;\n"
+                        "ALTER TABLE graph_edges_v3 RENAME TO graph_edges;\n"
+                        "CREATE INDEX IF NOT EXISTS idx_graph_target "
+                        "ON graph_edges(target);\n"
+                        "CREATE INDEX IF NOT EXISTS idx_graph_graph_name "
+                        "ON graph_edges(graph_name);\n"
+                        "CREATE INDEX IF NOT EXISTS idx_graph_target_graph "
+                        "ON graph_edges(target, graph_name);\n"
                     )
             self._state_repo.set("schema_version", str(SCHEMA_VERSION))
             self._conn.commit()
@@ -622,32 +698,42 @@ class _MemoryEntityRepo(EntityRepo):
 
 class _MemoryGraphRepo(GraphRepo):
     def __init__(self):
-        self._edges: dict[tuple[str, str], str] = {}  # (source, target) -> edge_type
+        # (source, target, graph_name) -> edge_type
+        self._edges: dict[tuple[str, str, str], str] = {}
+        self._graph_names: set[str] = set()
 
     def put_edge(self, source: str, target: str,
-                 edge_type: str = "explicit") -> None:
-        self._edges[(source, target)] = edge_type
+                 edge_type: str = "explicit",
+                 graph_name: str = "lexical") -> None:
+        self._edges[(source, target, graph_name)] = edge_type
+        self._graph_names.add(graph_name)
 
     def delete_outgoing(self, entity_id: str) -> None:
         for key in list(self._edges):
-            s, t = key
+            s, t, g = key
             if s == entity_id:
                 del self._edges[key]
 
     def delete_incoming(self, entity_id: str) -> None:
         for key in list(self._edges):
-            s, t = key
+            s, t, g = key
             if t == entity_id:
                 del self._edges[key]
 
-    def get_outgoing(self, entity_id: str) -> set[str]:
-        return {t for (s, t) in self._edges if s == entity_id}
+    def get_outgoing(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]:
+        if graph_name is None:
+            return {t for (s, t, g) in self._edges if s == entity_id}
+        return {t for (s, t, g) in self._edges if s == entity_id and g == graph_name}
 
-    def get_incoming(self, entity_id: str) -> set[str]:
-        return {s for (s, t) in self._edges if t == entity_id}
+    def get_incoming(self, entity_id: str,
+                     graph_name: str | None = None) -> set[str]:
+        if graph_name is None:
+            return {s for (s, t, g) in self._edges if t == entity_id}
+        return {s for (s, t, g) in self._edges if t == entity_id and g == graph_name}
 
     def iter_edges(self) -> Generator[tuple[str, str], None, None]:
-        for s, t in self._edges:
+        for s, t, g in self._edges:
             yield (s, t)
 
     def get_edge_count(self) -> int:
@@ -655,24 +741,36 @@ class _MemoryGraphRepo(GraphRepo):
 
     def get_all_outgoing(self) -> dict[str, set[str]]:
         result: dict[str, set[str]] = {}
-        for s, t in self._edges:
+        for s, t, g in self._edges:
             result.setdefault(s, set()).add(t)
         return result
 
     def get_outgoing_by_type(self, entity_id: str,
                              edge_type: str) -> set[str]:
-        return {t for (s, t), et in self._edges.items()
+        return {t for (s, t, g), et in self._edges.items()
                 if s == entity_id and et == edge_type}
 
     def get_incoming_by_type(self, entity_id: str,
                              edge_type: str) -> set[str]:
-        return {s for (s, t), et in self._edges.items()
+        return {s for (s, t, g), et in self._edges.items()
                 if t == entity_id and et == edge_type}
 
     def iter_edges_by_type(self, edge_type: str) -> Generator[tuple[str, str], None, None]:
-        for (s, t), et in self._edges.items():
+        for (s, t, g), et in self._edges.items():
             if et == edge_type:
                 yield (s, t)
+
+    def iter_edges_by_graph(self, graph_name: str) -> Generator[tuple[str, str], None, None]:
+        for (s, t, g) in self._edges:
+            if g == graph_name:
+                yield (s, t)
+
+    def get_graph_names(self) -> set[str]:
+        return self._graph_names
+
+    def get_edge_type(self, source: str, target: str,
+                      graph_name: str) -> str | None:
+        return self._edges.get((source, target, graph_name))
 
 
 class _MemoryIndexRepo(IndexRepo):

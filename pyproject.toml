@@ -9,7 +9,7 @@ description = "Compile raw notes (txt, md, docx, pdf, html, ...) into a linked, 
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Emmimal Alexander" }]
+authors = [{ name = "HO Tuong Vinh" }]
 dependencies = ["markitdown>=0.1"]
 keywords = ["wiki", "compiler", "notes", "markdown"]
 classifiers = [
@@ -24,7 +24,7 @@ classifiers = [
 wiki-cli = "src.compiler:main"
 
 [project.optional-dependencies]
-dev = ["ruff", "mypy", "markitdown"]
+dev = ["ruff", "mypy"]
 
 [tool.setuptools.packages.find]
 include = ["src", "src.*"]

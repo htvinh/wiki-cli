@@ -25,6 +25,7 @@ from graph import (
     graph_report,
 )
 from linter import LintReport, lint, print_report
+from relationship import RelationshipEngine
 from rewriter import compile_pages
 from source import FilesystemProvider, SourceProvider
 from store import (
@@ -140,6 +141,7 @@ class CompilerConfig:
     incremental: bool = True
     parallel: bool = False
     navigation_hubs: int = 0
+    strict: bool = False
     source_provider: SourceProvider | None = None
     extractors: list | None = None
     renderers: list | None = None
@@ -218,6 +220,7 @@ class CompilePlanner:
             graph_builder
             or (WordIndexGraphBuilder(navigation_hubs=nav) if store else None)
         )
+        self._relationship_engine = RelationshipEngine(store) if store else None
 
     def detect_changes(self, source_provider: SourceProvider,
                        raw_dir: str) -> ChangeSet:
@@ -248,8 +251,29 @@ class CompilePlanner:
         docs = list(source_provider.iter_documents(raw_dir))
         workers = self.config.workers
         if workers > 1 and len(docs) > 1:
-            return _extract_parallel(docs, workers)
-        return _extract_sequential(docs)
+            entities = _extract_parallel(docs, workers)
+        else:
+            entities = _extract_sequential(docs)
+
+        if self._store:
+            changed_ids = changes.added | changes.modified
+            for eid, ent in entities.items():
+                if eid in changed_ids:
+                    with open(ent.source_path, "rb") as f:
+                        body_bytes = f.read()
+                    self._store.entities.put(
+                        eid, name=ent.name, slug=ent.slug,
+                        aliases=", ".join(ent.aliases),
+                        created=ent.created,
+                        source_path=ent.source_path,
+                        body_hash="",
+                        source_hash=hashlib.sha256(body_bytes).hexdigest(),
+                        mtime=os.path.getmtime(ent.source_path),
+                        size=os.path.getsize(ent.source_path),
+                    )
+                    self._store.content.put(eid, ent.body)
+
+        return entities
 
     def graph(self, entities: dict[str, Entity],
               changes: ChangeSet | None = None) -> dict:
@@ -262,12 +286,34 @@ class CompilePlanner:
                                        top_n=self.config.navigation_hubs)
         return g
 
+    def compute_relationships(self, entities: dict[str, Entity]) -> None:
+        if not self._relationship_engine or not self._store:
+            return
+        self._relationship_engine.build_all(entities)
+
+    def get_related(self, entity_id: str,
+                    entities: dict[str, Entity]) -> list[tuple[str, str]]:
+        if not self._relationship_engine:
+            return []
+        return self._relationship_engine.compute_related(entity_id, entities)
+
+    def get_backlinks(self, entity_id: str,
+                      entities: dict[str, Entity]) -> list[tuple[str, str]]:
+        if not self._relationship_engine:
+            return []
+        return self._relationship_engine.compute_backlinks(entity_id, entities)
+
     def render(self, entities: dict[str, Entity], graph: dict,
                output_dir: str, raw_dir: str = "") -> list[str]:
+        if self._relationship_engine:
+            return compile_pages(entities, graph, output_dir, raw_dir,
+                                 compute_related_fn=self.get_related,
+                                 compute_backlinks_fn=self.get_backlinks,
+                                 entities_for_related=entities)
         return compile_pages(entities, graph, output_dir, raw_dir)
 
     def validate(self, output_dir: str) -> LintReport:
-        return lint(output_dir)
+        return lint(output_dir, store=self._store, strict=self.config.strict)
 
 
 # ── Compiler ─────────────────────────────────────────────────────────
@@ -372,6 +418,13 @@ class Compiler:
                                elapsed=graph_time,
                                payload={"edge_count": edge_count})
 
+            # compute relationships (multi-graph: navigation, link, folder)
+            t0 = time.perf_counter()
+            yield CompileEvent("phase_start", "relationships", t0)
+            self.planner.compute_relationships(entities)
+            yield CompileEvent("phase_end", "relationships", time.perf_counter(),
+                               elapsed=time.perf_counter() - t0)
+
             # render
             t0 = time.perf_counter()
             yield CompileEvent("phase_start", "render", t0)
@@ -392,10 +445,10 @@ class Compiler:
                 yield CompileEvent("phase_start", "lint", t0)
                 lint_report = self.planner.validate(output_dir)
                 yield CompileEvent("lint_result", "lint", time.perf_counter(),
-                                   payload={
-                                       "broken": len(lint_report.broken_links),
-                                        "lexical_unlinked": len(lint_report.lexical_unlinked_pages),
-                                   })
+                                    payload={
+                                        "broken": len(lint_report.broken_links),
+                                        "unreachable": len(lint_report.unreachable_pages),
+                                    })
                 yield CompileEvent("phase_end", "lint", time.perf_counter(),
                                    elapsed=time.perf_counter() - t0)
 
@@ -417,7 +470,7 @@ class Compiler:
                 deleted=len(changes.deleted),
                 broken_links=(len(lint_report.broken_links)
                               if lint_report else 0),
-                lexical_unlinked=(len(lint_report.lexical_unlinked_pages)
+                lexical_unlinked=(len(lint_report.unreachable_pages)
                                   if lint_report else 0),
                 elapsed_s=elapsed,
                 entities_per_sec=(len(entities) / elapsed
@@ -469,6 +522,8 @@ def main() -> int:
     parser.add_argument("output_dir", nargs="?", default=None,
                         help="Directory to write compiled .md pages into (default: raw_dir-wiki)")
     parser.add_argument("--no-lint", action="store_true", help="Skip the lint pass")
+    parser.add_argument("--strict", action="store_true",
+                        help="Report optional metadata warnings (missing created/aliases)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel extraction workers (default: 1)")
     parser.add_argument("--report", action="store_true",
@@ -480,6 +535,7 @@ def main() -> int:
     config = CompilerConfig(
         lint=not args.no_lint,
         workers=args.workers,
+        strict=args.strict,
     )
     compiler = Compiler(config=config)
 
@@ -495,12 +551,26 @@ def main() -> int:
                 sys.stdout.flush()
     result = compiler._result
     assert result is not None
-    print(
-        f"Compiled {result.pages_written} pages "
-        f"from {args.raw_dir} -> {args.output_dir}"
-    )
+    elapsed = result.stats.elapsed_s
     if result.lint_report:
+        ic = result.lint_report.index_pages
+        if ic:
+            print(
+                f"Compiled {result.lint_report.content_pages} content "
+                f"+ {ic} generated index page "
+                f"\u2192 {result.lint_report.total_pages} pages in {elapsed:.2f}s"
+            )
+        else:
+            print(
+                f"Compiled {result.pages_written} pages in {elapsed:.2f}s"
+            )
+        print(f"Output: {args.output_dir}")
         print_report(result.lint_report)
+    else:
+        print(
+            f"Compiled {result.pages_written} pages in {elapsed:.2f}s"
+        )
+        print(f"Output: {args.output_dir}")
     if args.report and result.graph_report:
         from graph import print_graph_report
         print_graph_report(result.graph_report,

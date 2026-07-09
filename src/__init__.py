@@ -39,6 +39,9 @@ from plugin import (
     WikiLinkResolver,
     WikiLinter,
 )
+from relationship import (
+    RelationshipEngine,
+)
 from source import (
     ConvertingDocument,
     Document,
@@ -83,6 +86,7 @@ __all__ = [
     "WikiLinkResolver",
     "WikiLinter",
     "WordIndexGraphBuilder",
+    "RelationshipEngine",
     "LintReport",
     "lint",
     "print_report",
