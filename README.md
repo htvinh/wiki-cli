@@ -139,20 +139,6 @@ python -m unittest src.tests -v
 
 136 tests — 18 classes covering store, migrations, compiler pipeline, change detection, incremental graph, parallel extraction, plugins, watcher, source provider, converter, multi-format.
 
-## Performance (M3 MacBook Air — baseline, no store)
-
-```bash
-python src/benchmark.py --files 100 --files 1000
-```
-
-| Files | Extract | Graph | Rewrite | Lint | Total |
-|-------|---------|-------|---------|------|-------|
-| 100   | ~6 ms   | ~1 ms | ~11 ms  | ~8 ms | ~26 ms |
-| 1,000 | ~67 ms  | ~19 ms| ~112 ms | ~79 ms| ~277 ms |
-
-Benchmark uses the raw pipeline (extract_all → build_graph → compile_pages → lint)
-without SQLite store overhead. Add the store for incremental production use.
-
 ## Input Formats
 
 | Extension | Format |
