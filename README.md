@@ -178,10 +178,6 @@ pip install -e ".[dev]"       # editable + ruff + mypy
 # or: pip install .            # production
 ```
 
-## CI
-
-`.github/workflows/ci.yml` — tests on 3.12/3.13, `ruff check`, `mypy`.
-
 ## Project Structure
 
 ```
